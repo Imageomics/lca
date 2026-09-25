@@ -12,7 +12,7 @@ import sys
 import json
 import datetime
 from collections import defaultdict
-from beta_stability.util.cluster_tools import percent_and_PR, build_node_to_cluster_mapping, hungarian_cluster_matching
+from beta_stability.util.cluster_tools import percent_and_PR, build_node_to_cluster_mapping, hungarian_cluster_matching, ceaf_cluster_matching
 # Import clustering functions directly
 from beta_stability.util.init_logger import init_logger
 from beta_stability.run import main as run_clustering
@@ -162,12 +162,16 @@ def calculate_evaluation_metrics(est_clustering, est_node2uuid, gt_clustering, g
 
         # Calculate Hungarian matching metrics (cluster-level)
         hungarian = hungarian_cluster_matching(aligned_est_clustering, aligned_gt_clustering)
+        ceaf = ceaf_cluster_matching(aligned_est_clustering, aligned_gt_clustering)
 
         return {
             'f1': f1,
             'precision': precision,
             'recall': recall,
             'frac_correct': frac_correct,
+            'ceaf_f1': ceaf['f1'],
+            'ceaf_precision': ceaf['precision'],
+            'ceaf_recall': ceaf['recall'],
             'hungarian_f1': hungarian['f1'],
             'hungarian_precision': hungarian['precision'],
             'hungarian_recall': hungarian['recall'],
@@ -276,6 +280,7 @@ def evaluate_field_separated_results(output_base, anno_file, config_log_file,
                     field_text += f"  Recall:                    {metrics.get('recall', 0):.4f}\n"
                     field_text += f"  Fraction Correct:          {metrics.get('frac_correct', 0):.4f}\n"
                     field_text += f"  Hungarian F1 Score:        {metrics.get('hungarian_f1', 0):.4f}\n"
+                    field_text += f"  CEAF F1 Score:        {metrics.get('ceaf_f1', 0):.4f}\n"
                     field_text += f"  Hungarian Precision:       {metrics.get('hungarian_precision', 0):.4f}\n"
                     field_text += f"  Hungarian Recall:          {metrics.get('hungarian_recall', 0):.4f}\n"
                     metrics_text.append(field_text)
@@ -303,6 +308,7 @@ def evaluate_field_separated_results(output_base, anno_file, config_log_file,
         summary_text += f"  Recall:                {avg_metrics['recall']:.4f}\n"
         summary_text += f"  Fraction Correct:      {avg_metrics['frac_correct']:.4f}\n"
         summary_text += f"  Hungarian F1 Score:    {avg_metrics['hungarian_f1']:.4f}\n"
+        summary_text += f"  CEAF F1 Score:    {avg_metrics.get('ceaf_f1', 0):.4f}\n"
         summary_text += f"  Hungarian Precision:   {avg_metrics['hungarian_precision']:.4f}\n"
         summary_text += f"  Hungarian Recall:      {avg_metrics['hungarian_recall']:.4f}\n"
 
@@ -613,6 +619,9 @@ def run_clustering_with_save(config, interactive=False, config_path=None, save_d
                     metrics_text += f"Recall:                        {metrics.get('recall', 0):.4f}\n"
                     metrics_text += f"Fraction Correct:              {metrics.get('frac_correct', 0):.4f}\n"
                     metrics_text += f"Hungarian F1 Score:            {metrics.get('hungarian_f1', 0):.4f}\n"
+                    metrics_text += f"CEAF F1 Score:            {metrics.get('ceaf_f1', 0):.4f}\n"
+                    metrics_text += f"CEAF Precision:           {metrics.get('ceaf_precision', 0):.4f}\n"
+                    metrics_text += f"CEAF Recall:              {metrics.get('ceaf_recall', 0):.4f}\n"
                     metrics_text += f"Hungarian Precision:           {metrics.get('hungarian_precision', 0):.4f}\n"
                     metrics_text += f"Hungarian Recall:              {metrics.get('hungarian_recall', 0):.4f}\n"
 
@@ -665,11 +674,41 @@ def main():
                        help="Directory to save formatted results (default: same as clustering output)")
     parser.add_argument("--interactive", "-i", action='store_true',
                        help="Enable interactive mode")
+    parser.add_argument("--seed", type=int, default=None,
+                       help="Override config seed; also redirects every output path "
+                            "to a seed<N>/ subdir so repeated seeds don't overwrite.")
+    parser.add_argument("--prob_human_correct", type=float, default=None,
+                       help="Override edge_weights.prob_human_correct (reviewer "
+                            "accuracy); also redirects outputs to a phc<NN>/ subdir.")
 
     args = parser.parse_args()
 
     # Load config (with optional base config merging)
     config = load_config(args.config, base_config_path=args.base_config)
+
+    # Optional reviewer-accuracy and seed overrides (imperfect-reviewer experiments),
+    # redirecting outputs to phc<NN>/seed<N>/ so the sweep does not overwrite itself.
+    import os as _os
+    sub = ''
+    if args.prob_human_correct is not None:
+        config.setdefault('edge_weights', {})['prob_human_correct'] = args.prob_human_correct
+        sub = _os.path.join(sub, f"phc{int(round(args.prob_human_correct * 100))}")
+    if args.seed is not None:
+        config['seed'] = args.seed
+        sub = _os.path.join(sub, f"seed{args.seed}")
+    if sub:
+        def _reseed(d, key):
+            if isinstance(d, dict) and d.get(key):
+                p = d[key]
+                np = _os.path.join(_os.path.dirname(p), sub, _os.path.basename(p))
+                d[key] = np
+                # create the redirected directory so the logger/output can open it
+                dirp = np if key == 'output_path' else _os.path.dirname(np)
+                if dirp:
+                    _os.makedirs(dirp, exist_ok=True)
+        _reseed(config.get('data', {}), 'output_path')
+        for k in ('log_file', 'auto_threshold_plot_path'):
+            _reseed(config.get('logging', {}), k)
 
     # Run clustering and formatting
     metrics = run_clustering_with_save(config)

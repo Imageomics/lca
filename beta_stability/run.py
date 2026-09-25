@@ -164,6 +164,10 @@ def run(config):
         
         # Main loop - run until convergence or max iterations
         max_outer_iterations = config.get('algorithm', {}).get('max_outer_iterations', 100)
+        # An algorithm that presents one review per step declares how many steps it may need
+        # (manual / thresholded review); others do not set it and keep the configured cap.
+        max_outer_iterations = max(max_outer_iterations,
+                                   int(getattr(algorithm, 'required_outer_iterations', 0)))
         outer_iteration = 0
 
         while not algorithm.is_finished() and outer_iteration < max_outer_iterations:
@@ -317,10 +321,29 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run clustering algorithm.")
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--interactive', '-i', 
-                   action='store_true', 
+    parser.add_argument('--interactive', '-i',
+                   action='store_true',
                    help='Enable interactive mode')
+    parser.add_argument('--seed', type=int, default=None,
+                   help='Override config seed (also redirects every output path to a '
+                        'seed<N>/ subdir, so repeated seeds do not overwrite each other).')
     return parser.parse_args()
+
+
+def apply_seed_override(config, seed):
+    """Set the run seed and send all outputs to a per-seed subdir. Lets one base
+    config serve many seeds without generating a config file per seed."""
+    config['seed'] = seed
+    sub = f'seed{seed}'
+    def reseed(d, key):
+        if isinstance(d, dict) and d.get(key):
+            p = d[key]
+            d[key] = os.path.join(os.path.dirname(p), sub, os.path.basename(p))
+    reseed(config.get('data', {}), 'output_path')
+    reseed(config.get('logging', {}), 'log_file')
+    reseed(config.get('logging', {}), 'auto_threshold_plot_path')
+    reseed(config.get('stability', {}), 'stability_track_path')
+    return config
 
  
 
@@ -331,4 +354,6 @@ if __name__ == '__main__':
         print(f"Working with config {os.path.abspath(args.config)}")
         input("Press Enter to continue...")
     config = get_config(args.config)
+    if args.seed is not None:
+        config = apply_seed_override(config, args.seed)
     main(config)

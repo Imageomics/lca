@@ -21,6 +21,8 @@ Usage:
 """
 
 import argparse
+import yaml
+from pathlib import Path
 import json
 import os
 import pickle
@@ -38,6 +40,8 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import LabelEncoder, normalize
+
+from beta_stability.util.tools import resolve_checkpoints
 
 
 # ---------------------------------------------------------------
@@ -216,78 +220,31 @@ def nested_is(gt_s_ij, s_ij, N_v, N_n, n_hat=None, ci=False):
 # Data loading (replicates LCA pipeline filtering)
 # ---------------------------------------------------------------
 
-DATASET_CONFIGS = {
-    'beluga': {
-        'annotation_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/beluga/annotations_beluga.json',
-        'embedding_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/beluga/embeddings_beluga.pickle',
-        'name_keys': ['name'],
-        'id_key': 'uuid',
-        'viewpoint_list': ['up'],
-        'n_filter_min': 1,
-        'n_filter_max': 100,
-        'format': 'drone',
-    },
-    'GZCD': {
-        'annotation_file': '/fs/ess/PAS2136/ggr_data/image_data/GZCD/annotations/reid_census_region.json',
-        'embedding_file': '/fs/ess/PAS2136/ggr_data/image_data/GZCD/annotations/pipeline_steps_out/miew_id_step5/miewid_census_region.pickle',
-        'name_keys': ['individual_id'],
-        'id_key': 'uuid',
-        'viewpoint_list': ['right', 'backright', 'downright', 'frontright'],
-        'n_filter_min': 1,
-        'n_filter_max': 100,
-        'format': 'drone',
-    },
-    'giraffe': {
-        'annotation_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/giraffe/annotations_giraffe.json',
-        'embedding_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/giraffe/embeddings_giraffe.pickle',
-        'name_keys': ['name'],
-        'id_key': 'uuid',
-        'viewpoint_list': ['right'],
-        'n_filter_min': 1,
-        'n_filter_max': 100,
-        'format': 'drone',
-    },
-    'lion': {
-        'annotation_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/lion/annotations_lion.json',
-        'embedding_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/lion/embeddings_lion.pickle',
-        'name_keys': ['name'],
-        'id_key': 'uuid',
-        'viewpoint_list': None,
-        'n_filter_min': 1,
-        'n_filter_max': 100,
-        'format': 'drone',
-    },
-    'forestelephants': {
-        'annotation_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/forestelephants/annotations_forestelephants.json',
-        'embedding_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/forestelephants/embeddings_forestelephants.pickle',
-        'name_keys': ['individual_uuid'],
-        'id_key': 'uuid',
-        'viewpoint_list': ['right'],
-        'n_filter_min': 1,
-        'n_filter_max': 100,
-        'format': 'standard',
-    },
-    'plainszebra': {
-        'annotation_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/plainszebra/annotations_plainszebra.json',
-        'embedding_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/plainszebra/embeddings_plainszebra.pickle',
-        'name_keys': ['name'],
-        'id_key': 'uuid',
-        'viewpoint_list': ['left'],
-        'n_filter_min': 1,
-        'n_filter_max': 100,
-        'format': 'drone',
-    },
-    'whaleshark': {
-        'annotation_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/whaleshark/annotations_whaleshark.json',
-        'embedding_file': '/fs/ess/PAS2136/ggr_data/kate/data_embeddings/whaleshark/embeddings_whaleshark.pickle',
-        'name_keys': ['name'],
-        'id_key': 'uuid',
-        'viewpoint_list': ['left'],
-        'n_filter_min': 1,
-        'n_filter_max': 100,
-        'format': 'drone',
-    },
-}
+def _load_dataset_registry(path=None):
+    """Dataset paths for --dataset, kept out of the package.
+
+    Resolution order: explicit `path`, then $BETA_STABILITY_NIS_DATASETS, then
+    `configs/nis_datasets.yaml` next to the package. Site-specific paths are not
+    hardcoded here; a missing registry is an error, never a guess.
+    """
+    # An explicitly requested registry must exist; only the implicit locations fall through.
+    for c, explicit in ((path, True),
+                        (os.environ.get('BETA_STABILITY_NIS_DATASETS'), True),
+                        (Path(__file__).resolve().parents[1] / 'configs' / 'nis_datasets.yaml', False)):
+        if not c:
+            continue
+        if Path(c).is_file():
+            with open(c) as f:
+                return yaml.safe_load(f)
+        if explicit:
+            raise SystemExit(f'Dataset registry not found: {c}')
+    raise SystemExit(
+        'No NIS dataset registry found. Pass --datasets <file.yaml>, set '
+        'BETA_STABILITY_NIS_DATASETS, or create configs/nis_datasets.yaml '
+        '(mapping dataset name -> annotation_file, embedding_file, name_keys, ...).')
+
+
+DATASET_CONFIGS = None   # populated from the registry in main()
 
 
 def load_and_filter(dataset_name):
@@ -432,12 +389,43 @@ def hungarian_metrics(pred_labels, gt_labels):
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
-    return {'h_precision': precision, 'h_recall': recall, 'h_f1': f1}
+    # CEAF (phi4 / Dice): same optimal 1-1 cluster alignment, but matches are
+    # weighted by Dice similarity instead of thresholded at Jaccard>0.
+    dice = np.zeros((n_gt, n_pred))
+    for i, gid in enumerate(gt_ids):
+        gs = gt_clusters[gid]
+        for j, pid in enumerate(pred_ids):
+            ps = pred_clusters[pid]
+            inter = len(gs & ps)
+            denom = len(gs) + len(ps)
+            dice[i, j] = 2 * inter / denom if denom > 0 else 0
+    r2, c2 = linear_sum_assignment(-dice)
+    phi = float(dice[r2, c2].sum())
+    ceaf_p = phi / n_pred if n_pred else 0
+    ceaf_r = phi / n_gt if n_gt else 0
+    ceaf_f1 = 2 * ceaf_p * ceaf_r / (ceaf_p + ceaf_r) if (ceaf_p + ceaf_r) > 0 else 0
+
+    return {'h_precision': precision, 'h_recall': recall, 'h_f1': f1,
+            'ceaf_precision': ceaf_p, 'ceaf_recall': ceaf_r, 'ceaf_f1': ceaf_f1}
+
+
+_KMEANS_EVAL_CACHE = {}
 
 
 def evaluate_kmeans(embeddings, gt_labels, k, true_K, n_init=10):
-    """Run k-means and compute pairwise + Hungarian metrics."""
+    """Run k-means and compute pairwise + Hungarian + CEAF metrics.
+
+    The result depends ONLY on the integer k (embeddings, gt_labels and the
+    KMeans random_state are fixed within a run), so it is memoized by k. During
+    the budget sweep the same k recurs across runs and budgets -- especially once
+    the NIS estimate converges at higher budgets -- so the cache turns hundreds of
+    identical k-means fits into a few dozen, with byte-identical results.
+    """
     k = max(1, min(len(embeddings), round(k)))
+    cache_key = (k, n_init)
+    cached = _KMEANS_EVAL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     norm_emb = normalize(embeddings, norm='l2')
     kmeans = KMeans(n_clusters=k, random_state=42, n_init=n_init)
     pred_labels = kmeans.fit_predict(norm_emb)
@@ -473,7 +461,7 @@ def evaluate_kmeans(embeddings, gt_labels, k, true_K, n_init=10):
     # Hungarian metrics
     h = hungarian_metrics(pred_labels, gt_labels)
 
-    return {
+    result = {
         'k_used': k,
         'ari': ari,
         'precision': precision,
@@ -482,17 +470,28 @@ def evaluate_kmeans(embeddings, gt_labels, k, true_K, n_init=10):
         'h_precision': h['h_precision'],
         'h_recall': h['h_recall'],
         'h_f1': h['h_f1'],
+        'ceaf_precision': h.get('ceaf_precision', 0.0),
+        'ceaf_recall': h.get('ceaf_recall', 0.0),
+        'ceaf_f1': h.get('ceaf_f1', 0.0),
         'n_clusters': len(set(pred_labels)),
     }
+    _KMEANS_EVAL_CACHE[cache_key] = result
+    return result
 
 
 def find_optimal_ratio(gt_s_synth, s_ij, n_hat, n_nodes, budget, K_synth,
-                       n_trials=50):
+                       n_trials=50, workers=1):
     """Find optimal N_n/N_v ratio by simulating NIS with synthetic oracle.
 
     Creates ~20 candidate (N_v, N_n) allocations for the given budget,
     runs NIS n_trials times for each, and returns the ratio that minimizes
     MSE of K_hat vs K_synth.
+
+    With workers > 1 the trials run in parallel. Each trial reseeds the global RNG
+    (100000 + t) immediately before nested_is, so every trial's K_hat is identical to
+    the serial loop's; results are aggregated in the original (candidate, trial) order,
+    and any log output a trial produces is captured in the worker and replayed into the
+    log in that same order.
     """
     # Generate candidate N_v values (log-spaced for wide coverage)
     max_nv = min(budget // 2, n_nodes)
@@ -503,19 +502,43 @@ def find_optimal_ratio(gt_s_synth, s_ij, n_hat, n_nodes, budget, K_synth,
         for x in np.logspace(np.log10(2), np.log10(max_nv), 20)
     ))
 
-    best_mse = float('inf')
-    best_ratio = 7.0
-    results = []
-
+    plan = []
     for nv in nv_candidates:
         nn = max(2, budget // nv)
         if nn > n_nodes:
             nn = n_nodes
+        plan.append((nv, nn))
+
+    if workers > 1:
+        def _trial(task):
+            import contextlib, io
+            global _log_file
+            nv_, nn_, t_ = task
+            _log_file = None
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                np.random.seed(100000 + t_)
+                f_hat_, _, _, _ = nested_is(gt_s_synth, s_ij, nv_, nn_, n_hat=n_hat, ci=True)
+            return f_hat_, buf.getvalue()
+        tasks = [(nv, nn, t) for nv, nn in plan for t in range(n_trials)]
+        outs = _fork_map(_trial, tasks, workers, threads=1)
+        per_task = dict(zip(tasks, outs))
+
+    best_mse = float('inf')
+    best_ratio = 7.0
+    results = []
+
+    for nv, nn in plan:
         k_hats = []
         for t in range(n_trials):
-            np.random.seed(100000 + t)
-            f_hat, _, _, _ = nested_is(
-                gt_s_synth, s_ij, nv, nn, n_hat=n_hat, ci=True)
+            if workers > 1:
+                f_hat, captured = per_task[(nv, nn, t)]
+                if captured:
+                    log(captured[:-1] if captured.endswith('\n') else captured)
+            else:
+                np.random.seed(100000 + t)
+                f_hat, _, _, _ = nested_is(
+                    gt_s_synth, s_ij, nv, nn, n_hat=n_hat, ci=True)
             k_hats.append(f_hat)
         k_arr = np.array(k_hats)
         mse = float(np.mean((k_arr - K_synth) ** 2))
@@ -547,20 +570,123 @@ def budget_to_nv_nn(budget, n_nodes, ratio=7.0):
 # Main
 # ---------------------------------------------------------------
 
+
+def _fork_map(fn, tasks, workers, threads=1, parent_task=None):
+    """Evaluate fn(task) for every task in forked worker processes, returning results in
+    task order. fn is inherited through fork and never pickled, so this works no matter
+    how the script was launched (plain run, `python -m cProfile`, ...). Only tasks and
+    results cross process boundaries. A failing or dying worker raises; nothing is
+    skipped.
+
+    parent_task, if given, runs in this (parent) process after the workers are forked
+    and before results are collected. Multithreaded OpenMP work must happen here and
+    not in a forked child: the parent has already used OpenMP (k-means), and libgomp
+    is not fork-safe, so a forked child that opens a multi-thread team hangs."""
+    import multiprocessing as mp
+    import queue as _queue
+    ctx = mp.get_context('fork')
+    q_in, q_out = ctx.Queue(), ctx.Queue()
+
+    def _loop():
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=threads):
+            while True:
+                item = q_in.get()
+                if item is None:
+                    return
+                i, task = item
+                try:
+                    q_out.put((i, True, fn(task)))
+                except BaseException as e:            # report, never swallow
+                    q_out.put((i, False, repr(e)))
+
+    procs = [ctx.Process(target=_loop, daemon=True) for _ in range(max(1, min(workers, len(tasks))))]
+    for pr in procs:
+        pr.start()
+    for i, t in enumerate(tasks):
+        q_in.put((i, t))
+    for _ in procs:
+        q_in.put(None)
+    out, got = [None] * len(tasks), 0
+    try:
+        if parent_task is not None:
+            parent_task()
+        while got < len(tasks):
+            try:
+                i, ok, res = q_out.get(timeout=30)
+            except _queue.Empty:
+                dead = [pr.exitcode for pr in procs if pr.exitcode not in (None, 0)]
+                if dead:
+                    raise RuntimeError(f'worker process died (exit codes {dead})')
+                continue
+            if not ok:
+                raise RuntimeError(f'worker failed on task {tasks[i]!r}: {res}')
+            out[i] = res
+            got += 1
+    finally:
+        for pr in procs:
+            if pr.is_alive():
+                pr.join(timeout=5)
+            if pr.is_alive():
+                pr.terminate()
+    return out
+
+
+def prefill_kmeans_cache(embeddings, gt_labels, true_K, ks, n_init, workers, parent_task=None):
+    """Evaluate every distinct k once, in parallel, and store it in _KMEANS_EVAL_CACHE.
+
+    Exact: evaluate_kmeans depends only on k (fixed data, KMeans random_state=42), and
+    k-means labels were verified identical across 1/4/16 threads on real data, so a
+    worker returns exactly what the serial sweep computes. The sweep loop is unchanged;
+    it simply finds each evaluation already cached. Hundreds of full-dataset k-means
+    fits per sweep were the dominant cost (nested_is itself is ~0.02 s per call).
+    """
+    todo = sorted({k for k in ks if (k, n_init) not in _KMEANS_EVAL_CACHE})
+    if workers <= 1 or len(todo) <= 1:
+        return 0
+    res = _fork_map(lambda k: evaluate_kmeans(embeddings, gt_labels, k, true_K, n_init=n_init),
+                    todo, workers, threads=1, parent_task=parent_task)
+    for k, r in zip(todo, res):
+        _KMEANS_EVAL_CACHE[(k, n_init)] = r
+    return len(todo)
+
+
 def main():
     global _log_file
 
+    # The registry defines the valid --dataset values, so it is read first by a
+    # pre-parser; `parents=` then re-exposes --datasets in the real help text.
+    # allow_abbrev=False: without it '--dataset X' is taken as an abbreviation
+    # of '--datasets' and the registry path becomes the dataset name.
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    pre.add_argument('--datasets', default=None,
+                     help='Dataset registry YAML (default: $BETA_STABILITY_NIS_DATASETS '
+                          'or configs/nis_datasets.yaml)')
+    pre_args, _ = pre.parse_known_args()
+    global DATASET_CONFIGS
+    DATASET_CONFIGS = _load_dataset_registry(pre_args.datasets)
+
     parser = argparse.ArgumentParser(
-        description='Reference NIS estimator on LCA data')
+        description='Reference NIS estimator on LCA data', parents=[pre])
     parser.add_argument('--dataset', required=True,
-                        choices=list(DATASET_CONFIGS.keys()))
+                        choices=sorted(DATASET_CONFIGS.keys()))
     parser.add_argument('--N_v', type=int, default=50,
                         help='Number of sampled vertices')
     parser.add_argument('--N_n', type=int, default=100,
                         help='Number of neighbors per vertex (incl. self)')
     parser.add_argument('--runs', type=int, default=10,
                         help='Number of independent runs')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Processes for evaluating distinct k-means k values in parallel '
+                             'during --sweep (1 = serial). Results are identical either way.')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--prob_human_correct', type=float, default=1.0,
+                        help='Reviewer accuracy for the pairwise same/different '
+                             'oracle queries. 1.0 = perfect oracle (default). '
+                             '<1 flips each queried pair-label with probability '
+                             '(1-p), modelling an imperfect reviewer — same error '
+                             'model and review budget as the other methods. Only '
+                             'the queries are corrupted; evaluation uses true labels.')
     parser.add_argument('--log_file', type=str, default=None,
                         help='Path to save log output (default: '
                              'tmp/<dataset>/output/nis_reference.log)')
@@ -572,6 +698,10 @@ def main():
                         help='Max total GT lookups for sweep (default: 5000)')
     parser.add_argument('--budget_steps', type=int, default=10,
                         help='Number of evenly-spaced budget levels (default: 10)')
+    parser.add_argument('--report_at_reviews', default='N',
+                        help="Comma-separated extra sweep budgets evaluated in the same run "
+                             "(exact checkpoints); 'N' = number of annotations. Their rows carry "
+                             "'checkpoint': true. Budgets above --budget_max are not evaluated.")
     parser.add_argument('--embedding', default='miewid',
                         help='Embedding name; rewrites embedding_file path and '
                              'adds suffix to output log (default: miewid).')
@@ -648,6 +778,24 @@ def main():
     gt_s_ij = (gt_labels_arr[:, None] == gt_labels_arr[None, :]).astype(np.float64)
     log(f"  gt_s_ij computed in {time.time() - t0:.1f}s")
 
+    # Imperfect reviewer: the human answering NIS's pairwise same/different queries
+    # is wrong with probability (1 - prob_human_correct). We corrupt the QUERY matrix
+    # once per seed (each pair gets a fixed, possibly-wrong answer — consistent if the
+    # same pair is queried more than once), symmetric with the self-diagonal preserved.
+    # Evaluation still uses the true gt_labels; only the oracle queries are corrupted,
+    # matching the error model and review budget used by the other methods.
+    phc = float(args.prob_human_correct)
+    if phc < 1.0:
+        rng = np.random.default_rng(args.seed)
+        Nn = gt_s_ij.shape[0]
+        iu, iv = np.triu_indices(Nn, k=1)
+        flip = rng.random(iu.shape[0]) >= phc  # wrong with prob (1 - phc)
+        fi, fj = iu[flip], iv[flip]
+        gt_s_ij[fi, fj] = 1.0 - gt_s_ij[fi, fj]
+        gt_s_ij[fj, fi] = gt_s_ij[fi, fj]  # keep symmetric
+        log(f"  Imperfect reviewer (prob_human_correct={phc}): flipped "
+            f"{int(flip.sum())}/{iu.shape[0]} pair-labels (seed={args.seed})")
+
     # Precompute n_hat and K_hat_0 (zero-review estimate)
     n_hat = list(np.sum(s_ij, axis=1))
     n_hat_arr = np.array(n_hat)
@@ -666,8 +814,13 @@ def main():
         np.float64)
     K_synth_actual = len(set(synth_labels))
     budget_ref = args.budget_max if args.sweep else N_v * N_n
+    # Worker processes for the parallel phases. During the k-means prefill the parent
+    # process computes the oracle k-means (true K, reported after the sweep) with the
+    # same 4 threads the serial run uses, so 4 cores are kept free for it there.
+    _pool_workers = max(1, args.workers - 4) if args.workers > 4 else args.workers
     optimal_ratio, ratio_results = find_optimal_ratio(
-        gt_s_synth, s_ij, n_hat, n, budget_ref, K_synth_actual)
+        gt_s_synth, s_ij, n_hat, n, budget_ref, K_synth_actual,
+        workers=args.workers)
     log(f"  Synthetic K = {K_synth_actual} (k-means with k={K_synth})")
     log(f"  Reference budget = {budget_ref}")
     log(f"  Optimal ratio = {optimal_ratio:.2f} "
@@ -685,7 +838,13 @@ def main():
     if args.sweep:
         budgets = np.linspace(0, args.budget_max,
                               args.budget_steps + 1).astype(int).tolist()
-        budgets = sorted(set(budgets))
+        # Exact checkpoints (e.g. one review per annotation) are extra budgets evaluated in
+        # this same run. Every budget reseeds before sampling, so adding one leaves each grid
+        # row unchanged, and the ratio stays tuned to --budget_max.
+        checkpoint_budgets = {b for b in resolve_checkpoints(
+            [x for x in str(args.report_at_reviews).split(',') if x.strip()], n)
+            if b <= args.budget_max}
+        budgets = sorted(set(budgets) | checkpoint_budgets)
 
         log(f"\n=== Budget sweep: {len(budgets)} levels, "
             f"{args.runs} runs each ===")
@@ -703,6 +862,34 @@ def main():
             f"{'H_F1':>14} | {'H_Prec':>14} | {'H_Rec':>14}")
         log("-" * 140)
 
+        if args.workers > 1:
+            # Pass 1: every K_hat the loop below will produce. Each run reseeds the
+            # global RNG immediately before nested_is, so these are the same values;
+            # output is suppressed so nis.log is not altered.
+            import contextlib, io
+            _ks = set()
+            _saved_log_file = _log_file
+            _log_file = None
+            with contextlib.redirect_stdout(io.StringIO()):
+                for _b in budgets:
+                    if _b == 0:
+                        continue
+                    _nv, _nn = budget_to_nv_nn(_b, n, ratio=optimal_ratio)
+                    for _r in range(args.runs):
+                        np.random.seed(args.seed + _r)
+                        _fh, _, _, _ = nested_is(gt_s_ij, s_ij, _nv, _nn, n_hat=n_hat, ci=True)
+                        _ks.add(max(1, min(n, round(_fh))))
+            _log_file = _saved_log_file
+            _t_pf = time.time()
+            def _oracle_in_parent():
+                from threadpoolctl import threadpool_limits
+                with threadpool_limits(limits=4):
+                    evaluate_kmeans(embeddings, gt_labels, true_K, true_K)
+            _nfit = prefill_kmeans_cache(embeddings, gt_labels, true_K, _ks, n_init=3, workers=_pool_workers,
+                                         parent_task=_oracle_in_parent)
+            print(f"[prefill] {_nfit} distinct k-means evaluations on {args.workers} workers "
+                  f"in {time.time() - _t_pf:.1f}s", flush=True)
+
         for budget in budgets:
             if budget == 0:
                 # Singleton baseline: each node is its own cluster
@@ -715,6 +902,7 @@ def main():
                     'seed': args.seed,
                     'reviews': 0,
                     'h_f1': h['h_f1'],
+                    'ceaf_f1': h.get('ceaf_f1', None),
                     'pcc_f1': 0.0,
                     'h_precision': h['h_precision'],
                     'h_recall': h['h_recall'],
@@ -723,6 +911,11 @@ def main():
                     'budget': 0,
                     'actual_budget': 0,
                     'runs': args.runs,
+                    # every node is its own cluster
+                    'n_clusters': int(n),
+                    'true_clusters': int(true_K),
+                    'cluster_count_ratio': float(n / true_K),
+                    'per_run': [],
                 })
                 log(f"{0:>6} | {'--':>4} | {'--':>4} | {0:>8} | "
                     f"{'singletons':>14} | {n / true_K:>8.3f} | "
@@ -753,6 +946,10 @@ def main():
             hf1 = np.array([m['h_f1'] for m in metrics_b])
             hp = np.array([m['h_precision'] for m in metrics_b])
             hr = np.array([m['h_recall'] for m in metrics_b])
+            cf1 = np.array([m.get('ceaf_f1', 0.0) for m in metrics_b])
+            cp = np.array([m.get('ceaf_precision', 0.0) for m in metrics_b])
+            cr = np.array([m.get('ceaf_recall', 0.0) for m in metrics_b])
+            ncl = np.array([m['n_clusters'] for m in metrics_b])
 
             write_metrics_row(args.metrics_file, {
                 'method': 'nis',
@@ -765,9 +962,40 @@ def main():
                 'h_recall': float(hr.mean()),
                 'pcc_precision': float(precs.mean()),
                 'pcc_recall': float(recs.mean()),
+                'ceaf_f1': float(cf1.mean()),
+                'ceaf_precision': float(cp.mean()),
+                'ceaf_recall': float(cr.mean()),
                 'budget': int(budget),
+                **({'checkpoint': True} if budget in checkpoint_budgets else {}),
                 'actual_budget': int(actual),
                 'runs': int(args.runs),
+                # Cluster count of the clustering actually evaluated (k-means with
+                # k = round(K_hat), per run). Previously computed in evaluate_kmeans
+                # and discarded; K/K_true in the text log is the estimate, not this.
+                'n_clusters': float(ncl.mean()),
+                'n_clusters_std': float(ncl.std()),
+                'true_clusters': int(true_K),
+                'cluster_count_ratio': float(ncl.mean() / true_K),
+                'k_hat_mean': float(k_arr.mean()),
+                'k_hat_std': float(k_arr.std()),
+                # Raw per-run values, so any aggregate can be recomputed offline.
+                'per_run': [{
+                    'run': int(i),
+                    'seed': int(args.seed + i),
+                    'k_hat': float(k_hats_b[i]),
+                    'k_used': int(metrics_b[i]['k_used']),
+                    'n_clusters': int(metrics_b[i]['n_clusters']),
+                    'ceaf_f1': float(metrics_b[i].get('ceaf_f1', 0.0)),
+                    'ceaf_precision': float(metrics_b[i].get('ceaf_precision', 0.0)),
+                    'ceaf_recall': float(metrics_b[i].get('ceaf_recall', 0.0)),
+                    'h_f1': float(metrics_b[i]['h_f1']),
+                    'h_precision': float(metrics_b[i]['h_precision']),
+                    'h_recall': float(metrics_b[i]['h_recall']),
+                    'pcc_f1': float(metrics_b[i]['f1']),
+                    'pcc_precision': float(metrics_b[i]['precision']),
+                    'pcc_recall': float(metrics_b[i]['recall']),
+                    'ari': float(metrics_b[i]['ari']),
+                } for i in range(len(metrics_b))],
             })
 
             log(f"{actual:>6} | {N_v_b:>4} | {N_n_b:>4} | {non_self:>8} | "

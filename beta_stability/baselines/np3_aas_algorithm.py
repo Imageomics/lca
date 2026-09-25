@@ -23,6 +23,7 @@ from sklearn.metrics import pairwise_distances
 from scipy.optimize import linear_sum_assignment
 
 from beta_stability.util.cluster_tools import build_node_to_cluster_mapping
+from beta_stability.util.tools import resolve_checkpoints, CHECKPOINT_LABEL
 
 logger = logging.getLogger("beta_stability")
 
@@ -632,6 +633,8 @@ class NP3AASAlgorithm:
         # Validation
         self.validation_step = config.get('validation_step', 100)
         self.validation_initialized = False
+        # Exact evaluation checkpoints (util/tools.py); resolved once the node count is known.
+        self._checkpoints = set()
 
         logger.info("NP3+AAS Algorithm initialized")
         logger.info(f"  DBSCAN: eps={self.dbscan_eps}, min_samples={self.dbscan_min_samples}")
@@ -736,6 +739,7 @@ class NP3AASAlgorithm:
 
         n = len(self.node_ids)
         logger.info(f"Running NP3+AAS on {n} nodes")
+        self._checkpoints = set(resolve_checkpoints(self.config.get('report_at_reviews', ['N']), n))
 
         # Run DBSCAN
         logger.info(f"Running DBSCAN (eps={self.dbscan_eps}, "
@@ -801,6 +805,8 @@ class NP3AASAlgorithm:
                 else:
                     self.cannot_links.add(ordered)
                     self.must_links.discard(ordered)
+                if self.num_human_reviews in self._checkpoints:
+                    self._log_checkpoint()
 
         logger.info(f"Constraints: {len(self.must_links)} ML, "
                      f"{len(self.cannot_links)} CL "
@@ -981,6 +987,28 @@ class NP3AASAlgorithm:
                      f"sizes: {a_sizes[:10]}{'...' if len(a_sizes) > 10 else ''}")
         logger.info(f"FINCH:  {len(b_sizes)} clusters, "
                      f"sizes: {b_sizes[:10]}{'...' if len(b_sizes) > 10 else ''}")
+
+    def _log_checkpoint(self):
+        """Log the clustering after exactly `num_human_reviews` reviews: the NP3 refinement
+        applied to the constraints received so far, as it would be at the end of a batch.
+        Runs on copies of the clustering and constraint sets; the refinement draws no random
+        numbers, so the live run (including its sampling RNG) is left untouched."""
+        if not (self.cluster_validator and self.validation_initialized):
+            return
+        import copy
+        live = (self.clustering, self.node2cid, self.must_links, self.cannot_links)
+        try:
+            self.clustering = copy.deepcopy(live[0])
+            self.node2cid = dict(live[1])
+            self.must_links = set(live[2])
+            self.cannot_links = set(live[3])
+            self._apply_np3()
+            self.cluster_validator.incremental_stats(
+                self.num_human_reviews, self.clustering, self.node2cid,
+                self.cluster_validator.gt_clustering, self.cluster_validator.gt_node2cid,
+                CHECKPOINT_LABEL)
+        finally:
+            self.clustering, self.node2cid, self.must_links, self.cannot_links = live
 
     def _handle_validation(self):
         """Validate against ground truth (same pattern as stability algorithm)."""

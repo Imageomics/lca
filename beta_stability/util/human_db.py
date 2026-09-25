@@ -43,7 +43,8 @@ class human_db(object):
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
             instance_id TEXT,
-            heartbeat TIMESTAMP
+            heartbeat TIMESTAMP,
+            read_at TIMESTAMP
         )
         """)
         conn.commit()
@@ -51,6 +52,12 @@ class human_db(object):
         # Safe migration if table already existed without score column
         if not self._column_exists(conn, "image_verification", "score"):
             cursor.execute("ALTER TABLE image_verification ADD COLUMN score REAL NOT NULL DEFAULT 0.0")
+            conn.commit()
+
+        # __call__ stamps read_at when it consumes decisions; a table created by an
+        # older version of this file lacks the column and the UPDATE would fail.
+        if not self._column_exists(conn, "image_verification", "read_at"):
+            cursor.execute("ALTER TABLE image_verification ADD COLUMN read_at TIMESTAMP")
             conn.commit()
 
         conn.close()

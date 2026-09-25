@@ -107,18 +107,28 @@ def get_config(file_path):
     return config_dict
 
 
-def get_review(node_1, node_2, df, name_key, rate=0.98):
+def get_review(node_1, node_2, df, name_key, rate=0.98, error_mode='both'):
 
     is_similar = False
     if df.iloc[node_1][name_key] == df.iloc[node_2][name_key]:
         is_similar=True
-    
-    return is_similar if random.random() < rate else not is_similar
 
-def call_get_reviews(df, name_key, rate):
+    if random.random() < rate:
+        return is_similar                 # correct verdict
+    # This review would be an error. Optionally restrict which error TYPE fires:
+    #   'merge_only' -> only false-MERGE errors (truly different -> say "same");
+    #                   suppress false-SPLIT errors on truly-same pairs.
+    #   'split_only' -> only false-SPLIT errors (truly same -> say "different").
+    if error_mode == 'merge_only' and is_similar:
+        return is_similar                 # suppress irreversible false-split
+    if error_mode == 'split_only' and not is_similar:
+        return is_similar                 # suppress reversible false-merge
+    return not is_similar
+
+def call_get_reviews(df, name_key, rate, error_mode='both'):
     def get_reviews(edge_nodes, rate=rate):
         logger = logging.getLogger("beta_stability")
-        reviews = [(n0, n1, get_review(n0, n1, df, name_key, rate)) for n0, n1, _ in edge_nodes]
+        reviews = [(n0, n1, get_review(n0, n1, df, name_key, rate, error_mode)) for n0, n1, _ in edge_nodes]
         # quit_lca = random.random() < 0.4
         quit_lca = False
         return reviews, quit_lca
@@ -436,3 +446,34 @@ def connect_disconnected_clusters_strongest_node(G, node2cid):
     logger.info(f"Missing {len(added_edges)} edges between clusters")
     return added_edges
 
+
+# ---------------------------------------------------------------- evaluation
+# checkpoints
+#
+# `report_at_reviews` lists human-review counts at which a review-driven method
+# logs the clustering it holds after exactly that many reviews, even when the
+# count falls inside a review batch. The string 'N' stands for the number of
+# annotations (one review per annotation). A checkpoint is evaluation only: it
+# never changes what the run does next, so a run's regular evaluations are
+# identical with or without checkpoints.
+
+CHECKPOINT_LABEL = 'Checkpoint stats'
+
+
+def resolve_checkpoints(spec, num_nodes):
+    """Sorted review counts for `spec` (a list of ints and/or 'N', or a single one)."""
+    if spec is None:
+        return []
+    if isinstance(spec, (int, str)):
+        spec = [spec]
+    out = set()
+    for s in spec:
+        s = s.strip() if isinstance(s, str) else s
+        if s == 'N':
+            out.add(int(num_nodes))
+            continue
+        v = int(s)
+        if v <= 0:
+            raise ValueError(f'report_at_reviews entries must be positive review counts, got {s!r}')
+        out.add(v)
+    return sorted(out)

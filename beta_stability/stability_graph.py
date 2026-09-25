@@ -16,6 +16,7 @@ CRITICAL: Only positive edges can be deactivated (become positive-inactive).
 Negative edges are NEVER deactivated.
 """
 
+import os
 import networkx as nx
 import numpy as np
 from collections import defaultdict
@@ -28,11 +29,178 @@ from beta_stability.util.tools import order_edge
 logger = logging.getLogger("beta_stability")
 
 
+def _build_krt(mst, idx):
+    """Kruskal reconstruction tree over `mst` (edges added in DECREASING weight).
+    Internal node = one merge, carrying that merge's weight and edge. Bottleneck
+    of any pair = weight at their LCA, so all queries reduce to one LCA pass."""
+    n = len(idx)
+    edges = sorted(mst.edges(data='weight'), key=lambda t: t[2], reverse=True)
+    M = 2 * n
+    parent = np.full(M, -1, dtype=np.int64)
+    wt = np.zeros(M, dtype=np.float64)
+    eu = np.full(M, -1, dtype=np.int64); ev = np.full(M, -1, dtype=np.int64)
+    uf = list(range(n)); top = list(range(n))
+
+    def find(x):
+        r = x
+        while uf[r] != r: r = uf[r]
+        while uf[x] != r: uf[x], x = r, uf[x]
+        return r
+
+    nxt = n
+    for a, b, w in edges:
+        ra, rb = find(idx[a]), find(idx[b])
+        if ra == rb: continue
+        p = nxt; nxt += 1
+        parent[top[ra]] = p; parent[top[rb]] = p
+        wt[p] = w; eu[p] = a; ev[p] = b
+        uf[ra] = rb; top[rb] = p
+    K = nxt
+    par = parent[:K]
+    depth = np.zeros(K, dtype=np.int64); root = np.arange(K)
+    for v in range(K - 1, -1, -1):
+        p = par[v]
+        if p >= 0:
+            depth[v] = depth[p] + 1; root[v] = root[p]
+    LOG = max(1, int(np.ceil(np.log2(max(K, 2)))) + 1)
+    up = np.empty((LOG, K), dtype=np.int64)
+    up[0] = np.where(par >= 0, par, np.arange(K))
+    for k in range(1, LOG):
+        up[k] = up[k - 1][up[k - 1]]
+    return wt, eu, ev, depth, root, up, LOG
+
+
+def _bottleneck_lca(mst, idx, nu, nv):
+    """Bottleneck (weakest edge weight) on the tree path for many pairs at once.
+
+    Returns (qi, w) where qi indexes the pairs that are CONNECTED in `mst` and w
+    holds their bottleneck weights. Replaces per-pair `nx.shortest_path` walks:
+    one Kruskal reconstruction tree plus a vectorised binary-lifting LCA answers
+    every query, and the bottleneck of a tree path is unique so the values are
+    identical to walking each path.
+    """
+    wt, eu, ev, depth, root, up, LOG = _build_krt(mst, idx)
+    live = (root[nu] == root[nv]) & (nu != nv)
+    qi = np.flatnonzero(live)
+    if qi.size == 0:
+        return qi, np.zeros(0, dtype=np.float64)
+    a = nu[qi].copy(); b = nv[qi].copy()
+    swap = depth[a] < depth[b]
+    a[swap], b[swap] = b[swap].copy(), a[swap].copy()
+    diff = depth[a] - depth[b]
+    for k in range(LOG):
+        sel = ((diff >> k) & 1).astype(bool)
+        if sel.any():
+            a[sel] = up[k][a[sel]]
+    same = a == b
+    for k in range(LOG - 1, -1, -1):
+        ua, ub = up[k][a], up[k][b]
+        m = (~same) & (ua != ub)
+        if m.any():
+            a[m] = ua[m]; b[m] = ub[m]
+    lca = np.where(same, a, up[0][a])
+    return qi, wt[lca]
+
+
+def _edges_to_cut(mst, idx, inv, nu, nv, nconf, alpha):
+    """Vectorised replacement for `_bottleneck_edges` + the caller's cut loop.
+
+    Returns {(a, b): (u, v)} in ORIGINAL node ids -- the MST edges to deactivate
+    this round, keyed normalised, valued by the FIRST negative pair (in
+    `negatives` order) that demands the cut, matching `to_cut.setdefault` exactly.
+    `inv` maps index -> original id (eu/ev already hold original ids).
+    Never materialises a per-pair dict: the cut test is one boolean reduction.
+    """
+    wt, eu, ev, depth, root, up, LOG = _build_krt(mst, idx)
+    live = (root[nu] == root[nv]) & (nu != nv)      # still connected in the tree
+    qi = np.flatnonzero(live)
+    if qi.size == 0:
+        return {}
+    a = nu[qi].copy(); b = nv[qi].copy()
+    swap = depth[a] < depth[b]
+    a[swap], b[swap] = b[swap].copy(), a[swap].copy()
+    diff = depth[a] - depth[b]
+    for k in range(LOG):
+        sel = ((diff >> k) & 1).astype(bool)
+        if sel.any(): a[sel] = up[k][a[sel]]
+    same = a == b
+    for k in range(LOG - 1, -1, -1):
+        ua, ub = up[k][a], up[k][b]
+        m = (~same) & (ua != ub)
+        if m.any(): a[m] = ua[m]; b[m] = ub[m]
+    lca = np.where(same, a, up[0][a])
+
+    need = (wt[lca] - nconf[qi]) < alpha          # the cut condition, vectorised
+    sel = qi[need]
+    if sel.size == 0:
+        return {}
+    ea, eb = eu[lca[need]], ev[lca[need]]
+    lo = np.minimum(ea, eb); hi = np.maximum(ea, eb)
+    order = np.argsort(sel, kind='stable')        # first-in-negatives-order wins
+    lo, hi, sel = lo[order], hi[order], sel[order]
+    key = lo.astype(np.int64) * (int(max(hi.max(), lo.max())) + 1) + hi
+    _, first = np.unique(key, return_index=True)
+    pu = inv[nu[sel[first]]]; pv = inv[nv[sel[first]]]
+    return {(int(lo[i]), int(hi[i])): (int(x), int(y))
+            for i, x, y in zip(first, pu, pv)}
+
+def _bottleneck_edges(mst, negatives):
+    """Weakest edge on the max-strength (tree) path for every connected negative
+    pair, in one Kruskal pass instead of a per-pair tree walk.
+
+    `mst` is a maximum spanning forest (a tree per component). Adding its edges in
+    DECREASING weight, the edge that first unites the components of u and v is
+    exactly the minimum-weight edge on their unique path -- i.e. MSP(u,v) and the
+    edge to cut. Small-to-large endpoint matching keeps it O(E log E + K log K),
+    so a giant PCC no longer costs one full tree traversal per negative per round.
+
+    Returns {(u, v): (min_conf, min_edge)} for pairs connected in `mst`; pairs in
+    different components are omitted (already separated).
+    """
+    from collections import defaultdict
+    q_at = defaultdict(list)                      # node -> [(query_id, other_endpoint)]
+    for i, (u, v, _n) in enumerate(negatives):
+        if u != v and mst.has_node(u) and mst.has_node(v):
+            q_at[u].append((i, v))
+            q_at[v].append((i, u))
+    if not q_at:
+        return {}
+    parent = {n: n for n in mst.nodes()}
+    live = {n: ([n] if n in q_at else []) for n in mst.nodes()}   # query endpoints per root
+
+    def find(x):
+        r = x
+        while parent[r] != r:
+            r = parent[r]
+        while parent[x] != r:
+            parent[x], x = r, parent[x]
+        return r
+
+    answered = {}
+    for a, b, w in sorted(mst.edges(data='weight'), key=lambda t: t[2], reverse=True):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            continue
+        if len(live[ra]) > len(live[rb]):
+            ra, rb = rb, ra                       # ra = smaller side
+        for node in live[ra]:
+            for qi, other in q_at[node]:
+                if qi not in answered and find(other) == rb:
+                    answered[qi] = (w, (a, b))
+        live[rb].extend(live[ra])
+        parent[ra] = rb
+    return {(negatives[qi][0], negatives[qi][1]): val for qi, val in answered.items()}
+
+
 class EdgeLabel(Enum):
     """Edge label types."""
     POSITIVE = "positive"
     POSITIVE_INACTIVE = "positive-inactive"
     NEGATIVE = "negative"
+
+
+_LABEL_CODE = {EdgeLabel.POSITIVE: 0, EdgeLabel.POSITIVE_INACTIVE: 1, EdgeLabel.NEGATIVE: 2}
+_CODE_NEGATIVE = _LABEL_CODE[EdgeLabel.NEGATIVE]
 
 
 @dataclass
@@ -83,6 +251,19 @@ class StabilityGraph:
 
         # Track positive-inactive edges for fast external stability computation
         self._pos_inactive_edges: Set[Tuple[int, int]] = set()
+        # Columnar mirror of the edge table, built lazily and kept in step by
+        # _touch_edge() at every label/confidence write. Consumers that would
+        # otherwise walk the whole adjacency in Python (~3 us per edge visit, i.e.
+        # ~90 s per pass over 14.5M edges) read these instead. `None` = not built;
+        # any structural change (a NEW edge) drops it so it is rebuilt on demand.
+        self._earr_idx: Dict[Tuple[int, int], int] = {}
+        self._earr_u = None
+        self._earr_v = None
+        self._earr_lab = None
+        self._earr_conf = None
+        # rank of hi within G._adj[lo] for each mirror edge (lo < hi); built once,
+        # structure-dependent only, dropped together with the mirror
+        self._earr_rank = None
 
     def add_node(self, node_id: int):
         if node_id not in self.G:
@@ -114,14 +295,17 @@ class StabilityGraph:
                     new_data = EdgeData(label=label, confidence=confidence,
                                       score=score, ranker=ranker)
                 self.G[u][v]['data'] = new_data
+                self._touch_edge(u, v, new_data)
             else:
                 new_data = EdgeData(label=label, confidence=confidence,
                                                score=score, ranker=ranker)
                 self.G[u][v]['data'] = new_data
+                self._touch_edge(u, v, new_data)
         else:
             new_data = EdgeData(label=label, confidence=confidence,
                                                score=score, ranker=ranker)
             self.G.add_edge(u, v, data=new_data)
+            self._invalidate_edge_arrays()   # new edge -> mirror must be rebuilt
         # Increment new label count and maintain pos-inactive tracking
         self._increment_edge_count(label)
         key = (min(u, v), max(u, v))
@@ -161,6 +345,63 @@ class StabilityGraph:
         elif label == EdgeLabel.NEGATIVE:
             self._edge_counts['negative'] -= 1
 
+    # ------------------------------------------------------------------ arrays
+    def _ensure_edge_arrays(self):
+        """Materialise the columnar edge mirror (one O(E) pass, then maintained)."""
+        if self._earr_u is not None:
+            return
+        items = []
+        for u, v, attr in self.G.edges(data=True):
+            d = attr.get('data')
+            if d is None:
+                continue
+            items.append((u, v, int(d.label.value_code) if hasattr(d.label, 'value_code')
+                          else _LABEL_CODE[d.label], float(d.confidence)))
+        n = len(items)
+        self._earr_u = np.empty(n, dtype=np.int64)
+        self._earr_v = np.empty(n, dtype=np.int64)
+        self._earr_lab = np.empty(n, dtype=np.int8)
+        self._earr_conf = np.empty(n, dtype=np.float64)
+        self._earr_idx = {}
+        for i, (u, v, lab, conf) in enumerate(items):
+            self._earr_u[i] = u; self._earr_v[i] = v
+            self._earr_lab[i] = lab; self._earr_conf[i] = conf
+            self._earr_idx[(u, v) if u <= v else (v, u)] = i
+
+    def _invalidate_edge_arrays(self):
+        self._earr_u = self._earr_v = self._earr_lab = self._earr_conf = None
+        self._earr_idx = {}
+        self._earr_rank = None
+
+    def _touch_edge(self, u, v, edge_data):
+        """Propagate one edge's label/confidence into the mirror. No-op until built."""
+        if self._earr_u is None:
+            return
+        i = self._earr_idx.get((u, v) if u <= v else (v, u))
+        if i is None:
+            self._invalidate_edge_arrays()      # new edge -> rebuild on next use
+            return
+        self._earr_lab[i] = _LABEL_CODE[edge_data.label]
+        self._earr_conf[i] = float(edge_data.confidence)
+
+    def verify_edge_arrays(self):
+        """Rebuild from the graph and compare -- catches any unhooked write site."""
+        keep = (self._earr_u, self._earr_v, self._earr_lab, self._earr_conf, self._earr_idx)
+        self._invalidate_edge_arrays()
+        self._ensure_edge_arrays()
+        fresh = (self._earr_u, self._earr_v, self._earr_lab, self._earr_conf, self._earr_idx)
+        self._earr_u, self._earr_v, self._earr_lab, self._earr_conf, self._earr_idx = keep
+        if keep[0] is None:
+            return True
+        ok = (len(keep[4]) == len(fresh[4]))
+        if ok:
+            for k, i in fresh[4].items():
+                j = keep[4].get(k)
+                if j is None or fresh[2][i] != keep[2][j] or abs(fresh[3][i] - keep[3][j]) > 1e-12:
+                    ok = False
+                    break
+        return ok
+
     def deactivate_positive(self, edge: Tuple[int, int], deactivator: Tuple[int, int] = None):
         """
         Deactivate a POSITIVE edge (make it positive-inactive).
@@ -183,12 +424,56 @@ class StabilityGraph:
         self._edge_counts['positive_inactive'] += 1
         edge_data.label = EdgeLabel.POSITIVE_INACTIVE
         edge_data.deactivator = deactivator
+        self._touch_edge(u, v, edge_data)
         self._pos_inactive_edges.add((min(u, v), max(u, v)))
         self._pcc_cache_valid = False
+
+
+
+    def flip_negative_to_positive(self, u: int, v: int, confidence: float):
+        """Contract: flip a NEGATIVE edge to POSITIVE at a chosen confidence
+        (merges the two PCCs). Used by the merge-dual."""
+        if not self.G.has_edge(u, v):
+            return
+        ed = self.G[u][v].get('data')
+        if not ed or ed.label != EdgeLabel.NEGATIVE:
+            return
+        self._decrement_edge_count(EdgeLabel.NEGATIVE)
+        ed.label = EdgeLabel.POSITIVE
+        ed.confidence = confidence
+        self._touch_edge(u, v, ed)
+        self._increment_edge_count(EdgeLabel.POSITIVE)
+        self._pcc_cache_valid = False
+
+    def restore_to_negative(self, u: int, v: int, confidence: float):
+        """Restore an edge (that we flipped and that the re-cut demoted) back to
+        NEGATIVE, so a human's confirmed 'different' is never overruled."""
+        if not self.G.has_edge(u, v):
+            return
+        ed = self.G[u][v].get('data')
+        if not ed or ed.label == EdgeLabel.NEGATIVE:
+            return
+        self._decrement_edge_count(ed.label)
+        ed.label = EdgeLabel.NEGATIVE
+        ed.confidence = confidence
+        self._touch_edge(u, v, ed)
+        self._increment_edge_count(EdgeLabel.NEGATIVE)
+        self._pos_inactive_edges.discard((min(u, v), max(u, v)))
+        self._pcc_cache_valid = False
+
 
     def _invalidate_cache(self):
         """Invalidate PCC cache. MST is rebuilt explicitly when needed."""
         self._pcc_cache_valid = False
+
+    def _positive_edges_scan_order(self):
+        """(u, v, conf) arrays of POSITIVE edges in exact G.edges(data=True) order."""
+        self._ensure_edge_arrays()
+        if self._earr_u is None or self._earr_u.size == 0:
+            z = np.zeros(0, dtype=np.int64)
+            return z, z, np.zeros(0, dtype=np.float64)
+        i = np.flatnonzero(self._earr_lab == _LABEL_CODE[EdgeLabel.POSITIVE])
+        return self._earr_u[i], self._earr_v[i], self._earr_conf[i]
 
     def _ensure_pcc_cache(self):
         if not self._pcc_cache_valid:
@@ -200,10 +485,16 @@ class StabilityGraph:
         Compute PCCs using ONLY positive edges (not positive-inactive).
         Per PDF: "PCCs (positive edges only, not positive-inactive) correspond to individuals"
         """
-        positive_edges = [
-            (u, v) for u, v, data in self.G.edges(data=True)
-            if data.get('data') and data['data'].label == EdgeLabel.POSITIVE
-        ]
+        # Positive edges come from the columnar mirror instead of a Python scan of
+        # all edges. The mirror is built by iterating G.edges(data=True) and nothing
+        # ever removes an edge from G, so its positive entries are the same (u, v)
+        # pairs, same orientation, same order as the old list comprehension. The
+        # networkx graph below is therefore built identically, and connected
+        # components come out in the same order with sets of the same iteration
+        # order -- pcc ids, and anything that iterates a PCC set, are unchanged.
+        # This ran on every PCC-cache invalidation, i.e. after every label change.
+        _pu, _pv, _ = self._positive_edges_scan_order()
+        positive_edges = list(zip(_pu.tolist(), _pv.tolist()))
 
         positive_graph = nx.Graph()
         positive_graph.add_nodes_from(self.G.nodes())
@@ -216,16 +507,28 @@ class StabilityGraph:
             for node in pcc:
                 self._node_to_pcc[node] = pcc_id
 
+        if os.environ.get('BETA_SELFCHECK'):
+            _ref_edges = [(u, v) for u, v, data in self.G.edges(data=True)
+                          if data.get('data') and data['data'].label == EdgeLabel.POSITIVE]
+            _rg = nx.Graph(); _rg.add_nodes_from(self.G.nodes()); _rg.add_edges_from(_ref_edges)
+            _ref = [set(c) for c in nx.connected_components(_rg)]
+            if (_ref_edges != positive_edges
+                    or [list(x) for x in _ref] != [list(x) for x in self._pccs]):
+                logger.error("SELFCHECK FAIL _compute_pccs")
+                raise AssertionError('_compute_pccs mismatch')
+            logger.info(f"SELFCHECK ok: compute_pccs {len(self._pccs)} PCCs")
+
     def _build_mst_forest(self):
         """
         Build MST forest for all active positive edges.
         Called explicitly at the start of phases that need MST.
         """
-        positive_edges = []
-        for u, v, data in self.G.edges(data=True):
-            edge_data = data.get('data')
-            if edge_data and edge_data.label == EdgeLabel.POSITIVE:
-                positive_edges.append((u, v, {'weight': edge_data.confidence}))
+        # Same mirror-backed positive edge list as _compute_pccs (identical order,
+        # orientation and weights), so the forest and its tie-breaking are unchanged.
+        # This full scan ran at the start of every candidate-generation call.
+        _pu, _pv, _pc = self._positive_edges_scan_order()
+        positive_edges = [(u, v, {'weight': c})
+                          for u, v, c in zip(_pu.tolist(), _pv.tolist(), _pc.tolist())]
 
         self._mst_forest = nx.Graph()
         self._mst_forest.add_nodes_from(self.G.nodes())
@@ -234,47 +537,19 @@ class StabilityGraph:
         # Build MST forest (one MST per connected component)
         self._mst_forest = nx.maximum_spanning_tree(self._mst_forest, weight='weight')
 
-    def sparsify_pccs(self) -> int:
-        """
-        Sparsify each PCC to its Maximum Spanning Tree.
+        if os.environ.get('BETA_SELFCHECK'):
+            _re = []
+            for u, v, data in self.G.edges(data=True):
+                ed = data.get('data')
+                if ed and ed.label == EdgeLabel.POSITIVE:
+                    _re.append((u, v, {'weight': ed.confidence}))
+            _rg = nx.Graph(); _rg.add_nodes_from(self.G.nodes()); _rg.add_edges_from(_re)
+            _rm = nx.maximum_spanning_tree(_rg, weight='weight')
+            if list(_rm.edges(data='weight')) != list(self._mst_forest.edges(data='weight')):
+                logger.error("SELFCHECK FAIL _build_mst_forest")
+                raise AssertionError('_build_mst_forest mismatch')
+            logger.info(f"SELFCHECK ok: mst_forest {self._mst_forest.number_of_edges()} edges")
 
-        For each PCC, keeps only the MST edges as positive and deactivates
-        all other positive edges (-> positive-inactive). This ensures PCCs
-        are tree-structured, so make_zero_stable converges in one pass.
-
-        Should be called once after initial graph construction (before Phase 0).
-
-        Returns: Number of edges deactivated.
-        """
-        self._ensure_pcc_cache()
-
-        # Build MST of positive edges
-        self._build_mst_forest()
-        mst_edges = set()
-        for u, v in self._mst_forest.edges():
-            mst_edges.add((min(u, v), max(u, v)))
-
-        # Deactivate all positive edges NOT in the MST
-        deactivations = 0
-        for u, v, data in list(self.G.edges(data=True)):
-            edge_data = data.get('data')
-            if edge_data and edge_data.label == EdgeLabel.POSITIVE:
-                key = (min(u, v), max(u, v))
-                if key not in mst_edges:
-                    edge_data.label = EdgeLabel.POSITIVE_INACTIVE
-                    edge_data.deactivator = None
-                    self._pos_inactive_edges.add(key)
-                    deactivations += 1
-
-        if deactivations > 0:
-            self._edge_counts['positive'] -= deactivations
-            self._edge_counts['positive_inactive'] += deactivations
-            self._pcc_cache_valid = False
-
-        logger.info(f"Sparsified PCCs: kept {len(mst_edges)} MST edges, "
-                    f"deactivated {deactivations} non-MST positive edges")
-
-        return deactivations
 
     def get_pccs(self) -> List[Set[int]]:
         self._ensure_pcc_cache()
@@ -371,6 +646,192 @@ class StabilityGraph:
             return msp_strength - edge_data.confidence
 
         return msp_strength
+
+    def per_pcc_internal_stability(self):
+        """Per-PCC internal stability, for tracking over time.
+
+        Returns a list of (anchor_node, size, internal_stability), one per PCC.
+        anchor_node = min node id (a stable-ish identity across iterations).
+        internal_stability = min over within-PCC negative pairs of
+        (MSP - neg_conf); None if the PCC has no internal negative (nothing can
+        destabilize it). Negative value = unstable (a cut is pending).
+        """
+        self._ensure_pcc_cache()
+        # Intra-PCC edges come from the columnar mirror instead of probing every
+        # node PAIR (14.7M has_edge() calls for a 5429-node PCC), and the per-pair
+        # `nx.shortest_path` walk -- one per intra-PCC negative, ~8.17M of them on
+        # whale shark 2023 -- is replaced by a single vectorised bottleneck-LCA
+        # pass. This runs on EVERY phase-0 iteration and throughout active review,
+        # and logs nothing itself, so its cost was previously invisible in the log.
+        intra = self._intra_pcc_edges()
+        out = []
+        for pcc_id, pcc in enumerate(self._pccs):
+            pcc_list = sorted(pcc)
+            anchor = pcc_list[0]
+            if len(pcc_list) < 2:
+                out.append((anchor, len(pcc_list), None))
+                continue
+            neg, pos = intra.get(pcc_id, ([], []))
+            if not neg or not pos:
+                out.append((anchor, len(pcc_list), None))
+                continue
+            pg = nx.Graph()
+            for u, v, c in pos:
+                pg.add_edge(u, v, weight=c)
+            mst = nx.maximum_spanning_tree(pg, weight='weight')
+            nodes = list(mst.nodes()); nidx = {n: i for i, n in enumerate(nodes)}
+            keep = [(u, v, nc) for (u, v, nc) in neg if u in nidx and v in nidx]
+            if not keep:
+                out.append((anchor, len(pcc_list), None))
+                continue
+            nu = np.fromiter((nidx[e[0]] for e in keep), dtype=np.int64, count=len(keep))
+            nv = np.fromiter((nidx[e[1]] for e in keep), dtype=np.int64, count=len(keep))
+            nc = np.fromiter((e[2] for e in keep), dtype=np.float64, count=len(keep))
+            qi, w = _bottleneck_lca(mst, nidx, nu, nv)
+            if qi.size == 0:
+                out.append((anchor, len(pcc_list), None))
+                continue
+            min_stab = float(np.min(w - nc[qi]))
+            out.append((anchor, len(pcc_list), min_stab))
+        if os.environ.get('BETA_SELFCHECK'):
+            ref = []
+            for pcc in self._pccs:
+                pl = sorted(pcc); anc = pl[0]
+                if len(pl) < 2:
+                    ref.append((anc, len(pl), None)); continue
+                ne, pe = [], []
+                for i in range(len(pl)):
+                    for j in range(i + 1, len(pl)):
+                        uu, vv = pl[i], pl[j]
+                        if self.G.has_edge(uu, vv):
+                            d = self.G[uu][vv].get('data')
+                            if d and d.label == EdgeLabel.NEGATIVE:
+                                ne.append((uu, vv, d.confidence))
+                            elif d and d.label == EdgeLabel.POSITIVE:
+                                pe.append((uu, vv, d.confidence))
+                if not ne or not pe:
+                    ref.append((anc, len(pl), None)); continue
+                pg2 = nx.Graph()
+                for uu, vv, cc in pe:
+                    pg2.add_edge(uu, vv, weight=cc)
+                m2 = nx.maximum_spanning_tree(pg2, weight='weight')
+                best = float('inf')
+                for uu, vv, ncf in ne:
+                    if not m2.has_node(uu) or not m2.has_node(vv):
+                        continue
+                    try:
+                        path = nx.shortest_path(m2, uu, vv)
+                    except nx.NetworkXNoPath:
+                        continue
+                    if len(path) < 2:
+                        continue
+                    mn = min(m2[path[k]][path[k + 1]]['weight'] for k in range(len(path) - 1))
+                    best = min(best, mn - ncf)
+                ref.append((anc, len(pl), best if best != float('inf') else None))
+            ok = len(ref) == len(out) and all(
+                a1 == b1 and c1 == d1 and ((e1 is None and f1 is None)
+                                           or (e1 is not None and f1 is not None and abs(e1 - f1) < 1e-9))
+                for (a1, c1, e1), (b1, d1, f1) in zip(ref, out))
+            if not ok:
+                logger.error("SELFCHECK FAIL per_pcc_internal_stability")
+                raise AssertionError('per_pcc_internal_stability mismatch')
+            logger.info(f"SELFCHECK ok: per_pcc_internal {len(out)} PCCs")
+        return out
+
+    def _intra_pcc_edges(self):
+        """{pcc_id: (negatives, positives)} for intra-PCC edges, each list of
+        (u, v, confidence) in ascending (u, v) order -- the same order the old
+        node-pair loop produced, so MSTs built from `positives` break ties the
+        same way. One vectorised pass over the edge mirror."""
+        self._ensure_edge_arrays()
+        res: Dict[int, Tuple[list, list]] = {}
+        if self._earr_u is None or self._earr_u.size == 0:
+            return res
+        n = int(max(self._earr_u.max(), self._earr_v.max())) + 1
+        pcc_of = np.full(n, -1, dtype=np.int64)
+        for nd, pid in self._node_to_pcc.items():
+            if 0 <= nd < n:
+                pcc_of[nd] = pid
+        pu = pcc_of[self._earr_u]; pv = pcc_of[self._earr_v]
+        lab = self._earr_lab
+        neg_code = _LABEL_CODE[EdgeLabel.NEGATIVE]; pos_code = _LABEL_CODE[EdgeLabel.POSITIVE]
+        m = (pu >= 0) & (pu == pv) & ((lab == neg_code) | (lab == pos_code))
+        sel = np.flatnonzero(m)
+        if sel.size == 0:
+            return res
+        lo = np.minimum(self._earr_u[sel], self._earr_v[sel])
+        hi = np.maximum(self._earr_u[sel], self._earr_v[sel])
+        order = np.lexsort((hi, lo, pu[sel]))
+        sel = sel[order]; lo = lo[order]; hi = hi[order]
+        p = pu[sel]; c = self._earr_conf[sel]; l = lab[sel]
+        for i in range(sel.size):
+            b = res.get(int(p[i]))
+            if b is None:
+                b = ([], []); res[int(p[i])] = b
+            b[0 if l[i] == neg_code else 1].append((int(lo[i]), int(hi[i]), float(c[i])))
+        return res
+
+    def external_stabilities(self):
+        """External stability (max_neg - max_posinact) for every PCC pair that
+        has a crossing negative -- 'support for keeping them apart' per
+        separation decision. Same sign convention as internal stability:
+        >= 0 supported, < 0 unstable. Returns a flat list of values."""
+        self._ensure_pcc_cache()
+        # Fourth full-graph scan, replaced by the mirror. Result is a flat list
+        # consumed as an unordered distribution, so only the values matter.
+        max_neg, max_pi = self._cross_pcc_pair_maxima()
+        vals = [max_neg[k] - max_pi.get(k, 0.0) for k in max_neg]
+        if os.environ.get('BETA_SELFCHECK'):
+            rn, rp = {}, {}
+            for u, v, attr in self.G.edges(data=True):
+                ed = attr.get('data')
+                if ed is None:
+                    continue
+                pu_ = self._node_to_pcc.get(u); pv_ = self._node_to_pcc.get(v)
+                if pu_ is None or pv_ is None or pu_ == pv_:
+                    continue
+                k = (min(pu_, pv_), max(pu_, pv_))
+                if ed.label == EdgeLabel.NEGATIVE:
+                    if k not in rn or ed.confidence > rn[k]:
+                        rn[k] = ed.confidence
+                elif ed.label == EdgeLabel.POSITIVE_INACTIVE:
+                    if k not in rp or ed.confidence > rp[k]:
+                        rp[k] = ed.confidence
+            ref = sorted(rn[k] - rp.get(k, 0.0) for k in rn)
+            if len(ref) != len(vals) or any(abs(x - y) > 1e-9 for x, y in zip(ref, sorted(vals))):
+                logger.error("SELFCHECK FAIL external_stabilities")
+                raise AssertionError('external_stabilities mismatch')
+            logger.info(f"SELFCHECK ok: external_stabilities n={len(vals)}")
+        return vals
+
+    def _cross_pcc_pair_maxima(self):
+        """(max negative conf, max positive-inactive conf) per cross-PCC pair."""
+        self._ensure_edge_arrays()
+        if self._earr_u is None or self._earr_u.size == 0:
+            return {}, {}
+        n = int(max(self._earr_u.max(), self._earr_v.max())) + 1
+        pcc_of = np.full(n, -1, dtype=np.int64)
+        for nd, pid in self._node_to_pcc.items():
+            if 0 <= nd < n:
+                pcc_of[nd] = pid
+        pu = pcc_of[self._earr_u]; pv = pcc_of[self._earr_v]
+        cross = (pu >= 0) & (pv >= 0) & (pu != pv)
+        lo = np.minimum(pu, pv); hi = np.maximum(pu, pv)
+        K = int(hi.max()) + 1 if hi.size else 1
+        conf = self._earr_conf
+
+        def pair_max(mask):
+            i = np.flatnonzero(mask)
+            if i.size == 0:
+                return {}
+            k = lo[i] * K + hi[i]
+            uk, iv = np.unique(k, return_inverse=True)
+            mx = np.zeros(uk.size, dtype=np.float64)
+            np.maximum.at(mx, iv, conf[i])
+            return {(int(x // K), int(x % K)): float(y) for x, y in zip(uk, mx)}
+
+        return (pair_max(cross & (self._earr_lab == _LABEL_CODE[EdgeLabel.NEGATIVE])),
+                pair_max(cross & (self._earr_lab == _LABEL_CODE[EdgeLabel.POSITIVE_INACTIVE])))
 
     def compute_external_stability(self, pcc_a: int, pcc_b: int) -> Optional[float]:
         """
@@ -517,8 +978,77 @@ class StabilityGraph:
 
         return unstable
 
-    def make_zero_stable(self, alpha: float = 0.0,
-                         max_deactivations: int = -1) -> int:
+    def _ensure_adj_rank(self):
+        """For every mirror edge (lo < hi), the position of hi within G._adj[lo].
+
+        `make_zero_stable` historically built each PCC's subgraph by sweeping
+        `for a in pcc_set: for b in G[a]` and keeping b > a, so its edge insertion
+        order -- which networkx's MST uses to break equal-weight ties -- is
+        (position of a in the PCC set, position of b in a's adjacency dict). One
+        pass over the adjacency records the second key for every edge; the first
+        is cheap per call. Graph structure never changes in a run (edges are added
+        only during construction, which drops the mirror), so this is built once.
+        """
+        self._ensure_edge_arrays()
+        if self._earr_rank is not None or self._earr_u is None:
+            return
+        from array import array
+        A = array('q'); B = array('q'); R = array('q')
+        for a_, nbrs in self.G._adj.items():
+            r = 0
+            for b_ in nbrs:
+                if a_ < b_:
+                    A.append(a_); B.append(b_); R.append(r)
+                r += 1
+        A = np.frombuffer(A, dtype=np.int64); B = np.frombuffer(B, dtype=np.int64)
+        R = np.frombuffer(R, dtype=np.int64)
+        lo = np.minimum(self._earr_u, self._earr_v); hi = np.maximum(self._earr_u, self._earr_v)
+        N = int(max(hi.max() if hi.size else 0, B.max() if B.size else 0)) + 1
+        k_adj = A * N + B
+        o = np.argsort(k_adj, kind='stable')
+        k_sorted = k_adj[o]
+        k_m = lo * N + hi
+        pos = np.searchsorted(k_sorted, k_m)
+        if pos.size and not np.array_equal(k_sorted[np.minimum(pos, k_sorted.size - 1)], k_m):
+            raise AssertionError('adjacency rank alignment failed')
+        self._earr_rank = R[o][pos]
+
+    def _intra_edges_sweep_order(self):
+        """Per PCC id: (pos_lo, pos_hi, pos_conf, neg_lo, neg_hi, neg_conf) arrays in
+        the exact order the historical adjacency sweep in make_zero_stable emitted
+        them: PCC by PCC, then position of lo in the PCC set, then position of hi in
+        G._adj[lo]."""
+        self._ensure_adj_rank()
+        out = {}
+        if self._earr_u is None or self._earr_u.size == 0:
+            return out
+        n = int(max(self._earr_u.max(), self._earr_v.max())) + 1
+        pcc_of = np.full(n, -1, dtype=np.int64)
+        setpos = np.zeros(n, dtype=np.int64)
+        for pid, pcc in enumerate(self._pccs):
+            for i, nd in enumerate(pcc):
+                if 0 <= nd < n:
+                    pcc_of[nd] = pid; setpos[nd] = i
+        pu = pcc_of[self._earr_u]; pv = pcc_of[self._earr_v]
+        lab = self._earr_lab
+        pos_code = _LABEL_CODE[EdgeLabel.POSITIVE]; neg_code = _LABEL_CODE[EdgeLabel.NEGATIVE]
+        sel = np.flatnonzero((pu >= 0) & (pu == pv) & ((lab == pos_code) | (lab == neg_code)))
+        if sel.size == 0:
+            return out
+        lo = np.minimum(self._earr_u[sel], self._earr_v[sel])
+        hi = np.maximum(self._earr_u[sel], self._earr_v[sel])
+        order = np.lexsort((self._earr_rank[sel], setpos[lo], pu[sel]))
+        sel = sel[order]; lo = lo[order]; hi = hi[order]
+        pp = pu[sel]; ll = lab[sel]; cc = self._earr_conf[sel]
+        starts = np.flatnonzero(np.r_[True, pp[1:] != pp[:-1]])
+        ends = np.r_[starts[1:], pp.size]
+        for st, en in zip(starts.tolist(), ends.tolist()):
+            gl = ll[st:en]; ip = gl == pos_code; ineg = gl == neg_code
+            out[int(pp[st])] = (lo[st:en][ip], hi[st:en][ip], cc[st:en][ip],
+                                lo[st:en][ineg], hi[st:en][ineg], cc[st:en][ineg])
+        return out
+
+    def make_zero_stable(self, alpha: float = 0.0) -> int:
         """
         Make the graph alpha-stable by deactivating positive edges.
 
@@ -530,141 +1060,114 @@ class StabilityGraph:
             alpha: Stability threshold. Default 0.0 for strict 0-stability.
                    Negative values (e.g., -0.1) allow small instabilities,
                    resulting in less aggressive fragmentation.
-            max_deactivations: -1 (default) = unlimited. Positive value caps the
-                   total number of deactivations per call. Used during active
-                   review to throttle the cascade: a single INTERNAL flip can
-                   trigger 100+ deactivations in an over-merged giant cluster,
-                   fragmenting it faster than the merge selectors can recover,
-                   causing a strict H-F1 decrease. Limiting cascade size to a
-                   small N (e.g. 5) spreads the fragmentation across batches,
-                   so H-F1 evolves gradually instead of dropping in spikes.
 
-        For each pair (u,v) with stability < alpha:
-        - Deactivate the min edge on the MSP path to split the PCC
+        For each within-PCC negative pair (u,v) with stability < alpha, one
+        step of Step 2 inactivates the weakest positive edge on MSP(u,v). The
+        PCC's maximum spanning tree is RECOMPUTED after each cut and the loop
+        repeats until every internal negative pair is at least alpha-stable --
+        per the paper, "once a negative starts to cause the removal of positive
+        edges, it continues until v_i and v_j are in different PCCs". Recomputing
+        the tree is what lets non-tree positive edges be reconsidered, so a
+        densely-connected pair is actually separated instead of leaving a severed
+        spanning-tree path while other edges still join it.
 
         Returns: Number of edges deactivated.
 
-        OPTIMIZATION: Build MST forest once, maintain incrementally within this function.
+        Cost: no global MST forest is built. Only PCCs that contain a negative
+        edge do any work, each on its own (small) positive subgraph; a PCC that
+        is already 0-stable costs a single local tree build.
         """
         deactivations = 0
 
-        # Build MST forest once at the start
-        self._build_mst_forest()
+        self._pcc_cache_valid = False
+        self._ensure_pcc_cache()
 
-        while True:
-            # Recompute PCCs after each round of deactivations
-            self._pcc_cache_valid = False
-            self._ensure_pcc_cache()
+        # Every PCC's positive and negative edges, from the edge mirror, in exactly
+        # the order the per-node adjacency sweep used to produce them. That sweep
+        # visited ~4,000 neighbours for every node of every PCC on every call (once
+        # per restabilisation, i.e. every review batch). Cuts inside one PCC only
+        # relabel that PCC's own edges and nothing here refreshes the PCC cache, so
+        # a single upfront grouping stays exact for the whole loop.
+        _groups = self._intra_edges_sweep_order()
 
-            # Process each PCC that has unstable pairs
-            made_progress = False
+        for _pid, pcc in enumerate(list(self._pccs)):
+            if len(pcc) < 2:
+                continue
+            pcc_set = pcc if isinstance(pcc, set) else set(pcc)
+            _g = _groups.get(_pid)
 
-            for pcc_id, pcc in enumerate(self._pccs):
-                if len(pcc) < 2:
-                    continue
+            P = nx.Graph()
+            P.add_nodes_from(pcc_set)
+            if _g is not None and _g[0].size:
+                P.add_edges_from((a, b, {'weight': c}) for a, b, c in
+                                 zip(_g[0].tolist(), _g[1].tolist(), _g[2].tolist()))
 
-                # Collect negative edges within this PCC using pair iteration
-                # (O(N^2) with N = PCC size, much faster than iterating all neighbors)
-                pcc_list = sorted(pcc)
-                negative_edges = []
-                for i in range(len(pcc_list)):
-                    for j in range(i + 1, len(pcc_list)):
-                        u, v = pcc_list[i], pcc_list[j]
-                        if self.G.has_edge(u, v):
-                            edge_data = self.G[u][v].get('data')
-                            if edge_data and edge_data.label == EdgeLabel.NEGATIVE:
-                                negative_edges.append((u, v, edge_data.confidence))
-
-                if not negative_edges:
-                    continue
-
-                # Extract MST for this PCC from global forest (no rebuild needed!)
-                mst = self._mst_forest.subgraph(pcc).copy()
-                pcc_deactivations = 0
-
-                # Process all unstable pairs in this PCC using the same MST
-                # Keep processing until no more unstable pairs or MST becomes disconnected
-                pcc_changed = True
-                while pcc_changed:
-                    pcc_changed = False
-
-                    # Precompute all paths in MST once per iteration (avoids repeated BFS)
-                    all_paths = dict(nx.all_pairs_shortest_path(mst))
-
-                    # Find unstable pairs using precomputed paths
-                    unstable_pairs = []
-                    for u, v, neg_conf in negative_edges:
-                        if not mst.has_node(u) or not mst.has_node(v):
+            if os.environ.get('BETA_SELFCHECK'):
+                _P0 = nx.Graph(); _P0.add_nodes_from(pcc_set); _neg0 = []
+                for a in pcc_set:
+                    for b, edge in self.G[a].items():
+                        if b <= a or b not in pcc_set:
                             continue
-
-                        # Look up precomputed path (O(1) instead of BFS)
-                        path = all_paths.get(u, {}).get(v)
-                        if path is None:
-                            continue  # Pair already separated
-
-                        if len(path) < 2:
+                        d = edge.get('data')
+                        if not d:
                             continue
+                        if d.label == EdgeLabel.POSITIVE:
+                            _P0.add_edge(a, b, weight=d.confidence)
+                        elif d.label == EdgeLabel.NEGATIVE:
+                            _neg0.append((a, b, d.confidence))
+                _negN = ([] if _g is None else
+                         list(zip(_g[3].tolist(), _g[4].tolist(), _g[5].tolist())))
+                if (list(_P0.edges(data='weight')) != list(P.edges(data='weight'))
+                        or _neg0 != _negN):
+                    logger.error(f"SELFCHECK FAIL make_zero_stable subgraph, PCC {_pid}")
+                    raise AssertionError('make_zero_stable subgraph/negatives order mismatch')
+                self._selfcheck_mzs = getattr(self, '_selfcheck_mzs', 0) + 1
 
-                        # Find minimum edge on path
-                        min_conf = float('inf')
-                        min_edge = None
-                        for i in range(len(path) - 1):
-                            a, b = path[i], path[i + 1]
-                            conf = mst[a][b]['weight']
-                            if conf < min_conf:
-                                min_conf = conf
-                                min_edge = (a, b)
+            if _g is None or _g[3].size == 0:
+                continue
 
-                        stability = min_conf - neg_conf
-                        if stability < alpha:
-                            unstable_pairs.append((u, v, stability, min_edge, neg_conf))
+            pcc_deactivations = 0
+            # Query arrays are built ONCE per PCC and reused by every cutting
+            # round: only P's EDGES change as we cut, never its node set.
+            _nodes = list(P.nodes())
+            _idx = {n: i for i, n in enumerate(_nodes)}
+            _inv = np.array(_nodes, dtype=np.int64)
+            _nu = _g[3]; _nv = _g[4]; _nc = _g[5]
+            _map = np.zeros(int(max(_inv.max(), _nu.max(), _nv.max())) + 1, dtype=np.int64)
+            _map[_inv] = np.arange(len(_nodes), dtype=np.int64)
+            _nu = _map[_nu]; _nv = _map[_nv]
+            while P.number_of_edges() > 0:
+                mst = nx.maximum_spanning_tree(P, weight='weight')
+                # Step 2, batched ("assign the weakest edge on the MSP for EACH
+                # unstable pair, then recompute"): cut the weakest edge of every
+                # pair with stability < alpha this round, then rebuild. Batching
+                # keeps the number of MST rebuilds small even when a giant
+                # over-merged PCC needs thousands of cuts.
+                #
+                # _edges_to_cut is the vectorised form of the old
+                # `_bottleneck_edges` + per-pair Python loop (kept below as the
+                # reference implementation); it cuts exactly the same edges with
+                # the same deactivators, verified pair-for-pair on this workload,
+                # at 29.5 s -> 4.7 s per round.
+                to_cut = _edges_to_cut(mst, _idx, _inv, _nu, _nv, _nc, alpha)
 
-                    if not unstable_pairs:
-                        break
+                if not to_cut:
+                    break  # every negative pair is now >= alpha-stable
 
-                    # Batching optimization: Cut multiple edges at once
-                    # Count which edges appear on paths of unstable pairs (greedy hitting set)
-                    edge_hit_count = {}
-                    edge_to_pairs = {}
-
-                    for u, v, stability, min_edge, neg_conf in unstable_pairs:
-                        # Count the min edge for this pair
-                        if min_edge not in edge_hit_count:
-                            edge_hit_count[min_edge] = 0
-                            edge_to_pairs[min_edge] = []
-                        edge_hit_count[min_edge] += 1
-                        edge_to_pairs[min_edge].append((u, v))
-
-                    # Sort edges by how many pairs they fix (descending)
-                    edges_to_cut = sorted(edge_hit_count.keys(),
-                                         key=lambda e: edge_hit_count[e],
-                                         reverse=True)
-
-                    # Deactivate edges in batch (greedy - most impactful first)
-                    for edge in edges_to_cut:
-                        if not mst.has_edge(edge[0], edge[1]):
-                            continue  # Already removed by previous cut in this batch
-
-                        # Deactivate this edge
-                        self.deactivate_positive(edge, deactivator=edge_to_pairs[edge][0])
+                for (a, b), deact in to_cut.items():
+                    if P.has_edge(a, b):
+                        self.deactivate_positive((a, b), deactivator=deact)
+                        P.remove_edge(a, b)
                         deactivations += 1
                         pcc_deactivations += 1
-                        made_progress = True
-                        pcc_changed = True
 
-                        # Remove from local MST and global forest
-                        mst.remove_edge(edge[0], edge[1])
-                        if self._mst_forest.has_edge(edge[0], edge[1]):
-                            self._mst_forest.remove_edge(edge[0], edge[1])
+            if pcc_deactivations > 0:
+                logger.info(f"PCC (size {len(pcc)}): deactivated "
+                            f"{pcc_deactivations} edges for {alpha}-stability")
 
-                # Log summary for this PCC
-                if pcc_deactivations > 0:
-                    logger.info(f"PCC (size {len(pcc)}): deactivated {pcc_deactivations} edges for {alpha}-stability")
-
-            # If no progress was made in any PCC, we're done
-            if not made_progress:
-                break
-
+        if os.environ.get('BETA_SELFCHECK'):
+            logger.info(f"SELFCHECK ok: make_zero_stable subgraphs {getattr(self, '_selfcheck_mzs', 0)} PCCs (cumulative)")
+        self._pcc_cache_valid = False
         return deactivations
 
     def _get_msp_for_pair(self, u: int, v: int, pcc_id: int) -> Optional[Tuple[float, Tuple[int, int]]]:
@@ -1159,6 +1662,8 @@ class StabilityGraph:
         verified_edges: Optional[Set[Tuple[int, int]]] = None,
         unverified_threshold: float = 0.0,
         pcc_separation_strength: Optional[Dict[int, float]] = None,
+        include_weak_positive: bool = False,
+        review_positive_inactive: bool = False,
     ) -> Dict[str, List["StabilityCandidate"]]:
         """Generate sorted candidate pools (no batch cap, no selection).
 
@@ -1192,6 +1697,9 @@ class StabilityGraph:
         external_pool: List[StabilityCandidate] = []
         unverified_pool: List[StabilityCandidate] = []
         _verified = verified_edges or set()
+        # Intra-PCC negatives for every PCC in one vectorised pass, in ascending
+        # (u, v) order -- exactly the order the node-pair loop produced.
+        _intra_all = self._intra_pcc_edges()
 
         for pcc_id, pcc in enumerate(self._pccs):
             if len(pcc) < 2:
@@ -1220,6 +1728,47 @@ class StabilityGraph:
                 if mst_parent[node] is not None:
                     mst_subtree_size[mst_parent[node]] += mst_subtree_size[node]
 
+            # Chuck's internal-pool fix: the stability of a pair with no
+            # negative edge is just its MSP strength (the min positive edge on
+            # the path). The negative-edge loop below never emits these, so a
+            # component held together only by weak positives -- canonically a
+            # wrong size-2 component -- is never flagged even when its weakest
+            # link is below beta. Here we add the missing branch: if the PCC's
+            # weakest MST edge (its bottleneck = min internal MSP) is below the
+            # SAME threshold alpha (beta) already in use, emit it as an INTERNAL
+            # candidate reviewing that edge. Same pool, same priority, no new
+            # threshold. (Pairs that also have a negative edge are handled by
+            # the loop below and, being more unstable, win the 1-per-PCC slot.)
+            if include_weak_positive:
+                _weak_edge = None
+                _weak_conf = float('inf')
+                for a, b, attr in mst.edges(data=True):
+                    edge_key = (min(a, b), max(a, b))
+                    if edge_key in _verified:
+                        continue
+                    conf = attr.get('weight', 1.0)
+                    if conf < _weak_conf:
+                        _weak_conf = conf
+                        _weak_edge = (a, b)
+                if _weak_edge is not None and _weak_conf < alpha:
+                    a, b = _weak_edge
+                    if mst_parent.get(b) == a:
+                        child = b
+                    elif mst_parent.get(a) == b:
+                        child = a
+                    else:
+                        child = b
+                    child_size = mst_subtree_size.get(child, 1)
+                    impact = float(min(child_size, n_pcc - child_size))
+                    internal_pool.append(StabilityCandidate(
+                        candidate_type="WEAK_POSITIVE",
+                        stability=_weak_conf,
+                        review_edge=_weak_edge,
+                        structural_impact=max(impact, 1.0),
+                        node_pair=_weak_edge,
+                        pcc_id=pcc_id,
+                    ))
+
             # Collect unverified MST edges below threshold
             if unverified_threshold > 0:
                 for a, b, attr in mst.edges(data=True):
@@ -1246,28 +1795,36 @@ class StabilityGraph:
                             pcc_id=pcc_id
                         ))
 
-            # Find intra-PCC negative edges for internal instability candidates
-            pcc_list = sorted(pcc)
-            negative_edges = []
-            for i in range(len(pcc_list)):
-                for j in range(i + 1, len(pcc_list)):
-                    u, v = pcc_list[i], pcc_list[j]
-                    if self.G.has_edge(u, v):
-                        edge_data = self.G[u][v].get('data')
-                        if edge_data and edge_data.label == EdgeLabel.NEGATIVE:
-                            negative_edges.append((u, v, edge_data.confidence))
+            # Intra-PCC negatives come from the precomputed index instead of probing
+            # every node pair, and each negative's tree path is rebuilt from the DFS
+            # parent pointers instead of materialising ALL pairs' paths with
+            # nx.all_pairs_shortest_path (O(n^2) paths per PCC, every call). A tree
+            # has exactly one path between two nodes, so the walk yields the same
+            # node sequence from u to v and the same first-minimum edge below.
+            negative_edges = _intra_all.get(pcc_id, ([], []))[0]
 
             if not negative_edges:
                 continue
 
-            # Precompute all paths in this PCC's MST (avoids repeated BFS)
-            all_paths = dict(nx.all_pairs_shortest_path(mst))
+            _depth = {mst_root: 0}
+            for _nd in mst_order:
+                _p = mst_parent[_nd]
+                if _p is not None:
+                    _depth[_nd] = _depth[_p] + 1
 
             for u, v, neg_conf in negative_edges:
-                # Look up precomputed path (O(1) instead of BFS)
-                path = all_paths.get(u, {}).get(v)
-                if path is None:
+                if u not in _depth or v not in _depth:
                     continue
+                _a, _b = u, v
+                _left, _right = [u], [v]
+                while _depth[_a] > _depth[_b]:
+                    _a = mst_parent[_a]; _left.append(_a)
+                while _depth[_b] > _depth[_a]:
+                    _b = mst_parent[_b]; _right.append(_b)
+                while _a != _b:
+                    _a = mst_parent[_a]; _left.append(_a)
+                    _b = mst_parent[_b]; _right.append(_b)
+                path = _left + _right[-2::-1]
 
                 if len(path) < 2:
                     continue
@@ -1305,48 +1862,202 @@ class StabilityGraph:
                         pcc_id=pcc_id
                     ))
 
+        if os.environ.get('BETA_SELFCHECK'):
+            _ref_internal = []
+            for _pid, _pcc in enumerate(self._pccs):
+                if len(_pcc) < 2:
+                    continue
+                _m = self._mst_forest.subgraph(_pcc).copy()
+                if _m.number_of_edges() == 0:
+                    continue
+                _n = len(_pcc); _root = next(iter(_pcc)); _par = {}; _ord = []; _st = [(_root, None)]
+                while _st:
+                    _x, _px = _st.pop(); _par[_x] = _px; _ord.append(_x)
+                    for _y in _m.neighbors(_x):
+                        if _y != _px:
+                            _st.append((_y, _x))
+                _sub = {_x: 1 for _x in _ord}
+                for _x in reversed(_ord):
+                    if _par[_x] is not None:
+                        _sub[_par[_x]] += _sub[_x]
+                if include_weak_positive:
+                    _we, _wc = None, float('inf')
+                    for _p1, _p2, _at in _m.edges(data=True):
+                        if (min(_p1, _p2), max(_p1, _p2)) in _verified:
+                            continue
+                        _c = _at.get('weight', 1.0)
+                        if _c < _wc:
+                            _wc, _we = _c, (_p1, _p2)
+                    if _we is not None and _wc < alpha:
+                        _p1, _p2 = _we
+                        _ch = _p2 if _par.get(_p2) == _p1 else (_p1 if _par.get(_p1) == _p2 else _p2)
+                        _cs = _sub.get(_ch, 1)
+                        _ref_internal.append(StabilityCandidate(
+                            candidate_type="WEAK_POSITIVE", stability=_wc, review_edge=_we,
+                            structural_impact=max(float(min(_cs, _n - _cs)), 1.0),
+                            node_pair=_we, pcc_id=_pid))
+                _pl = sorted(_pcc); _ne = []
+                for _i in range(len(_pl)):
+                    for _j in range(_i + 1, len(_pl)):
+                        _u, _v = _pl[_i], _pl[_j]
+                        if self.G.has_edge(_u, _v):
+                            _d = self.G[_u][_v].get('data')
+                            if _d and _d.label == EdgeLabel.NEGATIVE:
+                                _ne.append((_u, _v, _d.confidence))
+                if not _ne:
+                    continue
+                _ap = dict(nx.all_pairs_shortest_path(_m))
+                for _u, _v, _nc in _ne:
+                    _path = _ap.get(_u, {}).get(_v)
+                    if _path is None or len(_path) < 2:
+                        continue
+                    _mc, _me = float('inf'), None
+                    for _k in range(len(_path) - 1):
+                        _c = _m[_path[_k]][_path[_k + 1]]['weight']
+                        if _c < _mc:
+                            _mc, _me = _c, (_path[_k], _path[_k + 1])
+                    _stab = _mc - _nc
+                    if _stab < alpha:
+                        _imp = 1.0
+                        if _me is not None:
+                            _p1, _p2 = _me
+                            _ch = _p2 if _par.get(_p2) == _p1 else (_p1 if _par.get(_p1) == _p2 else _p2)
+                            _cs = _sub.get(_ch, 1)
+                            _imp = float(min(_cs, _n - _cs))
+                        _ref_internal.append(StabilityCandidate(
+                            candidate_type="INTERNAL", stability=_stab, review_edge=(_u, _v),
+                            structural_impact=max(_imp, 1.0), node_pair=(_u, _v), pcc_id=_pid))
+            if _ref_internal != internal_pool:
+                _k = next((i for i, (x, y) in enumerate(zip(_ref_internal, internal_pool)) if x != y), None)
+                logger.error(f"SELFCHECK FAIL internal pool: ref={len(_ref_internal)} new={len(internal_pool)} "
+                             f"first diff idx={_k}: {(_ref_internal[_k] if _k is not None else None)} vs "
+                             f"{(internal_pool[_k] if _k is not None else None)}")
+                raise AssertionError('internal candidate pool mismatch')
+            logger.info(f"SELFCHECK ok: internal_pool {len(internal_pool)} candidates")
+
         # Step 2: Generate external candidates.
         # Per PDF: external_stability = max_neg - max_pos_inactive for ANY
         # PCC pair with a negative edge (not just those with pos-inactive edges).
         pcc_pair_max_neg: Dict[Tuple[int, int], Tuple[float, Tuple[int, int]]] = {}
-        pcc_pair_pos_inactive: Dict[Tuple[int, int], float] = {}
+        # track the strongest positive-inactive EDGE per pair (conf, edge), so it
+        # can itself become a review target -- the dual of the INTERNAL negative.
+        pcc_pair_pos_inactive: Dict[Tuple[int, int], Tuple[float, Tuple[int, int]]] = {}
 
-        for u, v, attr in self.G.edges(data=True):
-            ed = attr.get('data')
-            if ed is None:
-                continue
-            pcc_u = self._node_to_pcc.get(u)
-            pcc_v = self._node_to_pcc.get(v)
-            if pcc_u is None or pcc_v is None or pcc_u == pcc_v:
-                continue
-            pcc_pair = (min(pcc_u, pcc_v), max(pcc_u, pcc_v))
-            if ed.label == EdgeLabel.NEGATIVE:
-                current = pcc_pair_max_neg.get(pcc_pair)
-                if current is None or ed.confidence > current[0]:
-                    pcc_pair_max_neg[pcc_pair] = (ed.confidence, (u, v))
-            elif ed.label == EdgeLabel.POSITIVE_INACTIVE:
-                current = pcc_pair_pos_inactive.get(pcc_pair, 0.0)
-                pcc_pair_pos_inactive[pcc_pair] = max(current, ed.confidence)
+        # Read the columnar edge mirror rather than walking all 14.5M edges in
+        # Python (~96 s per call, once per outer iteration). Two orderings from the
+        # original scan are load-bearing and are reproduced exactly:
+        #   * within a PCC pair, strict `>` keeps the FIRST edge attaining the max
+        #     confidence in G.edges() order -- that edge becomes the review target;
+        #   * the dicts are iterated later by insertion order, i.e. pairs ordered by
+        #     FIRST appearance in the scan.
+        # The mirror is built by iterating G.edges(data=True), so its index order is
+        # exactly that scan order.
+        self._ensure_edge_arrays()
+        _pmn, _ppi = {}, {}
+        if self._earr_u is not None and self._earr_u.size:
+            _n = int(max(self._earr_u.max(), self._earr_v.max())) + 1
+            _pcc_of = np.full(_n, -1, dtype=np.int64)
+            for _nd, _pid in self._node_to_pcc.items():
+                if 0 <= _nd < _n:
+                    _pcc_of[_nd] = _pid
+            _pu = _pcc_of[self._earr_u]; _pv = _pcc_of[self._earr_v]
+            _cross = (_pu >= 0) & (_pv >= 0) & (_pu != _pv)
+            _lo = np.minimum(_pu, _pv); _hi = np.maximum(_pu, _pv)
+            _K = int(_hi.max()) + 1 if _hi.size else 1
+            _key = _lo * _K + _hi
+            _conf = self._earr_conf
 
-        # Step 3: Build external candidates
-        # Skip candidates whose review edge is already verified (exhausted)
-        for pcc_pair, (max_neg_conf, max_neg_edge) in pcc_pair_max_neg.items():
-            edge_key = (min(max_neg_edge[0], max_neg_edge[1]), max(max_neg_edge[0], max_neg_edge[1]))
+            def _best(_mask):
+                _idx = np.flatnonzero(_mask)
+                if _idx.size == 0:
+                    return {}
+                _k = _key[_idx]; _c = _conf[_idx]
+                # max confidence, earliest scan position wins ties
+                _o = np.lexsort((_idx, -_c, _k))
+                _u1, _f1 = np.unique(_k[_o], return_index=True)
+                _best_i = _idx[_o[_f1]]
+                # first appearance of each pair, to reproduce dict insertion order
+                _o2 = np.lexsort((_idx, _k))
+                _u2, _f2 = np.unique(_k[_o2], return_index=True)
+                _first_i = _idx[_o2[_f2]]
+                _seq = np.argsort(_first_i, kind='stable')
+                return {(int(_lo[i]), int(_hi[i])):
+                        (float(_conf[i]), (int(self._earr_u[i]), int(self._earr_v[i])))
+                        for i in _best_i[_seq]}
+
+            _pmn = _best(_cross & (self._earr_lab == _LABEL_CODE[EdgeLabel.NEGATIVE]))
+            _ppi = _best(_cross & (self._earr_lab == _LABEL_CODE[EdgeLabel.POSITIVE_INACTIVE]))
+        pcc_pair_max_neg.update(_pmn)
+        pcc_pair_pos_inactive.update(_ppi)
+        if os.environ.get('BETA_SELFCHECK'):
+            _rmn, _rpi = {}, {}
+            for u, v, attr in self.G.edges(data=True):
+                ed = attr.get('data')
+                if ed is None:
+                    continue
+                pcc_u = self._node_to_pcc.get(u); pcc_v = self._node_to_pcc.get(v)
+                if pcc_u is None or pcc_v is None or pcc_u == pcc_v:
+                    continue
+                pr = (min(pcc_u, pcc_v), max(pcc_u, pcc_v))
+                if ed.label == EdgeLabel.NEGATIVE:
+                    cur = _rmn.get(pr)
+                    if cur is None or ed.confidence > cur[0]:
+                        _rmn[pr] = (ed.confidence, (u, v))
+                elif ed.label == EdgeLabel.POSITIVE_INACTIVE:
+                    cur = _rpi.get(pr)
+                    if cur is None or ed.confidence > cur[0]:
+                        _rpi[pr] = (ed.confidence, (u, v))
+            # values AND key order must match: the pair order drives candidate order
+            ok = (list(_rmn) == list(_pmn) and list(_rpi) == list(_ppi)
+                  and _rmn == _pmn and _rpi == _ppi)
+            if not ok:
+                logger.error(
+                    f"SELFCHECK FAIL candidate pools: neg {len(_rmn)}/{len(_pmn)} "
+                    f"order={list(_rmn)[:5]} vs {list(_pmn)[:5]}; "
+                    f"pi {len(_rpi)}/{len(_ppi)}")
+                raise AssertionError('generate_candidate_pools mirror mismatch')
+            logger.info(f"SELFCHECK ok: pools neg={len(_pmn)} posinact={len(_ppi)}")
+
+        # Step 3: Build external candidates.
+        # external stability = max_neg_conf - max_posinact_conf; a pair is a
+        # candidate when that is < alpha. The review edge is the DECISIVE side:
+        # normally the strongest crossing negative, but when review_positive_inactive
+        # is on and the strongest positive-inactive rivals/exceeds the negative,
+        # review the positive-inactive edge instead (the dual of INTERNAL negative;
+        # 'same' -> reactivate -> merge). Pairs joined by a positive-inactive with
+        # no crossing negative are only reachable when the flag is on.
+        # preserve the original (negative-pair) iteration order so the default-off
+        # path is byte-identical; append positive-inactive-only pairs after.
+        pairs = list(pcc_pair_max_neg)
+        if review_positive_inactive:
+            pairs += [p for p in pcc_pair_pos_inactive if p not in pcc_pair_max_neg]
+        for pcc_pair in pairs:
+            neg = pcc_pair_max_neg.get(pcc_pair)          # (conf, edge) or None
+            pi = pcc_pair_pos_inactive.get(pcc_pair)      # (conf, edge) or None
+            max_neg_conf = neg[0] if neg else 0.0
+            max_pi_conf = pi[0] if pi else 0.0
+            stability = max_neg_conf - max_pi_conf
+            if stability >= alpha:
+                continue
+            # pick the review edge: positive-inactive when it is the out-of-place side
+            if review_positive_inactive and pi is not None and max_pi_conf >= max_neg_conf:
+                review_edge = pi[1]
+            elif neg is not None:
+                review_edge = neg[1]
+            else:
+                continue
+            edge_key = (min(review_edge), max(review_edge))
             if edge_key in _verified:
                 continue
-            max_pos_inactive = pcc_pair_pos_inactive.get(pcc_pair, 0.0)
-            stability = max_neg_conf - max_pos_inactive
-
-            if stability < alpha:
-                pcc_a_id, pcc_b_id = pcc_pair
-                impact = float(min(len(self._pccs[pcc_a_id]), len(self._pccs[pcc_b_id])))
-                external_pool.append(StabilityCandidate(
-                    candidate_type="EXTERNAL",
-                    stability=stability,
-                    review_edge=max_neg_edge,
-                    structural_impact=max(impact, 1.0),
-                    pcc_pair=pcc_pair
-                ))
+            pcc_a_id, pcc_b_id = pcc_pair
+            impact = float(min(len(self._pccs[pcc_a_id]), len(self._pccs[pcc_b_id])))
+            external_pool.append(StabilityCandidate(
+                candidate_type="EXTERNAL",
+                stability=stability,
+                review_edge=review_edge,
+                structural_impact=max(impact, 1.0),
+                pcc_pair=pcc_pair
+            ))
 
         # Step 3a: Generate unverified negative candidates (potential merges)
         # Low-confidence negative edges between PCCs that haven't been human-reviewed
@@ -1400,6 +2111,10 @@ class StabilityGraph:
         def _sort_instability(pool: List[StabilityCandidate]):
             pool.sort(key=lambda c: c.stability)
 
+        # Internal pool now mixes negative-driven and weak-positive candidates;
+        # a single sort by stability puts the most unstable first, so the
+        # 1-per-PCC selection naturally prefers a negative-driven candidate
+        # over a weak-positive one when a PCC has both.
         _sort_instability(internal_pool)
         _sort_instability(external_pool)
         # Unverified candidates: weakest-confidence (or most-isolated) first.
@@ -1421,13 +2136,19 @@ class StabilityGraph:
             'unverified': unverified_pool,
         }
 
-    def apply_human_review(self, u: int, v: int, human_agrees: bool, ch: float):
+    def apply_human_review(self, u: int, v: int, human_agrees: bool, ch: float,
+                           cap_confidence: bool = True):
         """
         Apply human review result to an edge.
 
         Per PDF step 4:
         (a) Agree: add ch to edge confidence
         (b) Disagree: subtract ch; if negative, flip label and confidence
+
+        cap_confidence=True clamps the accumulated confidence at 1.0 (original
+        behavior). When False, confidence accumulates unbounded so repeated
+        confirmations build real evidence and a single conflicting review can't
+        flip a well-established edge (Chuck's suggestion).
         """
         if not self.G.has_edge(u, v):
             return
@@ -1438,7 +2159,8 @@ class StabilityGraph:
         edge_data.ranker = 'human'
 
         if human_agrees:
-            edge_data.confidence = min(1.0, edge_data.confidence + ch)
+            new_conf = edge_data.confidence + ch
+            edge_data.confidence = min(1.0, new_conf) if cap_confidence else new_conf
             # Re-activate positive-inactive edges when human confirms they're positive
             if edge_data.label == EdgeLabel.POSITIVE_INACTIVE:
                 edge_data.label = EdgeLabel.POSITIVE
@@ -1453,6 +2175,7 @@ class StabilityGraph:
                 elif edge_data.label == EdgeLabel.POSITIVE_INACTIVE:
                     edge_data.label = EdgeLabel.NEGATIVE
                 edge_data.confidence = abs(edge_data.confidence)
+        self._touch_edge(u, v, edge_data)
 
         # Update edge counts and pos-inactive tracking if label changed
         if edge_data.label != old_label:
@@ -1497,6 +2220,7 @@ class StabilityGraph:
         edge_data.ranker = 'human'
         # Saturate score to match the authoritative GT label.
         edge_data.score = 1.0 if is_positive else 0.0
+        self._touch_edge(u, v, edge_data)
 
         if edge_data.label != old_label:
             self._decrement_edge_count(old_label)
@@ -1528,26 +2252,21 @@ class StabilityGraph:
 
         pcc_sizes = [len(pcc) for pcc in self._pccs]
 
-        # Compute min internal stability using PCC pair iteration (not neighbor iteration)
+        _intra = self._intra_pcc_edges()
+
+        # Compute min internal stability using the per-PCC index built above
         min_internal = float('inf')
         for pcc_id, pcc in enumerate(self._pccs):
             if len(pcc) < 2:
                 continue
 
-            # Find intra-PCC edges by iterating node pairs (O(N^2) with N = PCC size)
-            pcc_list = sorted(pcc)
-            negative_edges = []
-            positive_edges = []
-            for i in range(len(pcc_list)):
-                for j in range(i + 1, len(pcc_list)):
-                    u, v = pcc_list[i], pcc_list[j]
-                    if self.G.has_edge(u, v):
-                        edge_data = self.G[u][v].get('data')
-                        if edge_data:
-                            if edge_data.label == EdgeLabel.NEGATIVE:
-                                negative_edges.append((u, v, edge_data.confidence))
-                            elif edge_data.label == EdgeLabel.POSITIVE:
-                                positive_edges.append((u, v, edge_data.confidence))
+            # Intra-PCC edges, read from the precomputed per-PCC index rather than
+            # probing every node PAIR. The docstring's "N small" does not hold on a
+            # graph with a 5429-node PCC: that is ~14.7M has_edge() probes per call,
+            # once per outer iteration. Lists are emitted in ascending (u, v) order,
+            # which is exactly the order the pair loop produced, so the MST built
+            # from positive_edges resolves ties identically.
+            negative_edges, positive_edges = _intra.get(pcc_id, ([], []))
 
             if not negative_edges:
                 continue
@@ -1585,27 +2304,57 @@ class StabilityGraph:
         pcc_pair_max_neg: Dict[Tuple[int, int], float] = {}
         pcc_pair_pos_inactive: Dict[Tuple[int, int], float] = {}
 
-        for u, v, attr in self.G.edges(data=True):
-            ed = attr.get('data')
-            if ed is None:
-                continue
-            pcc_u = self._node_to_pcc.get(u)
-            pcc_v = self._node_to_pcc.get(v)
-            if pcc_u is None or pcc_v is None or pcc_u == pcc_v:
-                continue
-            pcc_pair = (min(pcc_u, pcc_v), max(pcc_u, pcc_v))
-            if ed.label == EdgeLabel.NEGATIVE:
-                current = pcc_pair_max_neg.get(pcc_pair, 0.0)
-                pcc_pair_max_neg[pcc_pair] = max(current, ed.confidence)
-            elif ed.label == EdgeLabel.POSITIVE_INACTIVE:
-                current = pcc_pair_pos_inactive.get(pcc_pair, 0.0)
-                pcc_pair_pos_inactive[pcc_pair] = max(current, ed.confidence)
+        # Cross-PCC maxima from the mirror (shared with external_stabilities()).
+        pcc_pair_max_neg, pcc_pair_pos_inactive = self._cross_pcc_pair_maxima()
 
         for pcc_pair, max_neg in pcc_pair_max_neg.items():
             max_pi = pcc_pair_pos_inactive.get(pcc_pair, 0.0)
             stab = max_neg - max_pi
             if stab < min_external:
                 min_external = stab
+
+        if os.environ.get('BETA_SELFCHECK'):
+            _rn, _rp = {}, {}
+            for u, v, attr in self.G.edges(data=True):
+                ed = attr.get('data')
+                if ed is None:
+                    continue
+                a_ = self._node_to_pcc.get(u); b_ = self._node_to_pcc.get(v)
+                if a_ is None or b_ is None or a_ == b_:
+                    continue
+                pr = (min(a_, b_), max(a_, b_))
+                if ed.label == EdgeLabel.NEGATIVE:
+                    _rn[pr] = max(_rn.get(pr, 0.0), ed.confidence)
+                elif ed.label == EdgeLabel.POSITIVE_INACTIVE:
+                    _rp[pr] = max(_rp.get(pr, 0.0), ed.confidence)
+            _rext = float('inf')
+            for pr, mn in _rn.items():
+                _rext = min(_rext, mn - _rp.get(pr, 0.0))
+            _rintra = {}
+            for pid, pcc in enumerate(self._pccs):
+                if len(pcc) < 2:
+                    continue
+                pl = sorted(pcc); ne, pe = [], []
+                for i in range(len(pl)):
+                    for j in range(i + 1, len(pl)):
+                        uu, vv = pl[i], pl[j]
+                        if self.G.has_edge(uu, vv):
+                            d = self.G[uu][vv].get('data')
+                            if d:
+                                if d.label == EdgeLabel.NEGATIVE:
+                                    ne.append((uu, vv, d.confidence))
+                                elif d.label == EdgeLabel.POSITIVE:
+                                    pe.append((uu, vv, d.confidence))
+                if ne or pe:
+                    _rintra[pid] = (ne, pe)
+            _ok = (_rext == min_external
+                   and all(_rintra.get(k, ([], [])) == v for k, v in _intra.items())
+                   and all(_intra.get(k, ([], [])) == v for k, v in _rintra.items()))
+            if not _ok:
+                logger.error(f"SELFCHECK FAIL get_graph_stats: ext {_rext} vs {min_external}; "
+                             f"intra pccs {len(_rintra)} vs {len(_intra)}")
+                raise AssertionError('get_graph_stats mirror mismatch')
+            logger.info(f"SELFCHECK ok: graph_stats ext={min_external:.6f} intra_pccs={len(_intra)}")
 
         return {
             'num_nodes': self.G.number_of_nodes(),
@@ -1625,52 +2374,3 @@ class StabilityGraph:
             'mst_forest_edges': self._mst_forest.number_of_edges() if self._mst_forest else 0
         }
 
-    def densify_component(self, component: Set[int], classifier_manager,
-                         max_edges: int = 2000, prioritize_negatives: bool = False,
-                         on_positive_added=None) -> int:
-        """
-        Add missing edges within a component.
-
-        Args:
-            component: Set of node IDs in the component
-            classifier_manager: Classifier to use for edge classification
-            max_edges: Maximum number of edges to add
-            prioritize_negatives: If True, sort by score ascending (adds likely negatives first).
-                                  If False, sort by score descending (adds likely positives first).
-                                  Default False reduces aggressive fragmentation.
-            on_positive_added: Optional callback(u, v) invoked for each newly-added
-                               POSITIVE edge — lets the caller (e.g. the algorithm)
-                               react to accumulating positives.
-        """
-        first_classifier = classifier_manager.algo_classifiers[0] if classifier_manager.algo_classifiers else None
-        if first_classifier is None:
-            return 0
-
-        embeddings, _ = classifier_manager.classifier_units[first_classifier]
-
-        nodes = list(component)
-        missing_edges = []
-
-        for i in range(len(nodes)):
-            for j in range(i + 1, len(nodes)):
-                n0, n1 = nodes[i], nodes[j]
-                if not self.G.has_edge(n0, n1):
-                    score = embeddings.get_score(n0, n1)
-                    missing_edges.append((n0, n1, score))
-
-        # Sort by score: ascending (negatives first) or descending (positives first)
-        missing_edges.sort(key=lambda x: x[2], reverse=not prioritize_negatives)
-        if len(missing_edges) > max_edges:
-            missing_edges = missing_edges[:max_edges]
-
-        added = 0
-        for n0, n1, score in missing_edges:
-            edge = classifier_manager.classify_edge(n0, n1, first_classifier)
-            _, _, score, confidence, label, ranker = edge
-            edge_label = EdgeLabel.POSITIVE if label == "positive" else EdgeLabel.NEGATIVE
-            self.add_edge(n0, n1, edge_label, confidence, score, ranker)
-            added += 1
-            if edge_label == EdgeLabel.POSITIVE and on_positive_added is not None:
-                on_positive_added(n0, n1)
-
-        return added

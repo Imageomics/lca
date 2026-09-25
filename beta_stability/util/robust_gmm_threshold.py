@@ -15,8 +15,17 @@ def _logsumexp(x):
 
 
 def _fit_gmm(X, K=2, max_iter=100, tol=1e-6, reg=1e-6,
-             entropy_alpha=1.0, n_init=1, verbose=False, print_func=print):
-    """Fit K-component GMM with entropy regularization."""
+             entropy_alpha=1.0, n_init=1, verbose=False, print_func=print,
+             rng=None):
+    """Fit K-component GMM with entropy regularization.
+
+    ``rng`` is a ``numpy.random.Generator`` used for the random restarts. It is
+    intentionally decoupled from the global ``np.random`` state so the fitted
+    threshold depends only on the score data, not on whatever seed the caller
+    set for other stochastic parts of the pipeline (e.g. reviewer errors).
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
     n = len(X)
     best_ll = -np.inf
     best_params = None
@@ -27,7 +36,7 @@ def _fit_gmm(X, K=2, max_iter=100, tol=1e-6, reg=1e-6,
             percentiles = np.linspace(0, 100, K + 2)[1:-1]
             mu = np.percentile(X, percentiles)
         else:
-            indices = np.random.choice(n, size=K, replace=False)
+            indices = rng.choice(n, size=K, replace=False)
             mu = np.sort(X[indices])
 
         sigma2 = np.full(K, np.var(X) / K)
@@ -84,6 +93,20 @@ def _compute_f1(threshold, pi, mu, sigma2):
     precision = TP / (TP + FP)
     recall = TP / (TP + FN)
     return 2 * precision * recall / (precision + recall)
+
+
+def _compute_pr(threshold, pi, mu, sigma2):
+    """Predicted (precision, recall) at threshold from the fitted 2-component GMM.
+    These are the *separate* ingredients of the F1 above; the review-confidence
+    auto needs them apart (precision deficit -> over-merge -> gentler reviews;
+    recall deficit -> under-connection -> more decisive reviews)."""
+    cdf = [stats.norm.cdf(threshold, mu[k], np.sqrt(sigma2[k])) for k in range(2)]
+    TP = pi[1] * (1 - cdf[1])
+    FP = pi[0] * (1 - cdf[0])
+    FN = pi[1] * cdf[1]
+    if TP <= 0:
+        return float('nan'), float('nan')
+    return TP / (TP + FP), TP / (TP + FN)
 
 
 def _find_threshold(pi, mu, sigma2):
@@ -187,7 +210,7 @@ def _fit_is_degenerate(pi, mu, sigma2):
 
 def find_threshold(scores, entropy_alpha=0.85, n_init=1, verbose=False,
                    print_func=print, plot_path=None, fallback_percentile=99,
-                   max_implied_K=None):
+                   max_implied_K=None, random_state=0):
     """
     Find optimal classification threshold from unlabeled scores.
 
@@ -225,6 +248,11 @@ def find_threshold(scores, entropy_alpha=0.85, n_init=1, verbose=False,
     """
     scores = np.asarray(scores).ravel()
 
+    # Dedicated RNG for the GMM restarts — decoupled from global np.random so the
+    # threshold is reproducible across runs that differ only in an unrelated seed
+    # (e.g. reviewer-error seeds in the imperfect-reviewer experiment).
+    rng = np.random.default_rng(random_state)
+
     def _use_fallback(reason):
         fallback = float(np.percentile(scores, fallback_percentile))
         print_func(f"⚠ {reason}; falling back to p{fallback_percentile} "
@@ -233,11 +261,14 @@ def find_threshold(scores, entropy_alpha=0.85, n_init=1, verbose=False,
             _plot_fallback_threshold(scores, fallback, plot_path, fallback_percentile)
             print_func(f"📊 Saved fallback plot to: {plot_path}")
         find_threshold._last_predicted_f1 = float('nan')
+        find_threshold._last_predicted_precision = float('nan')
+        find_threshold._last_predicted_recall = float('nan')
         return fallback
 
     # Fit K=2 GMM
     k2_result = _fit_gmm(scores, K=2, entropy_alpha=entropy_alpha,
-                         n_init=n_init, verbose=verbose, print_func=print_func)
+                         n_init=n_init, verbose=verbose, print_func=print_func,
+                         rng=rng)
     if k2_result is None:
         return _use_fallback("K=2 GMM did not converge (all inits produced NaN log-likelihood)")
     pi, mu, sigma2 = k2_result
@@ -249,7 +280,8 @@ def find_threshold(scores, entropy_alpha=0.85, n_init=1, verbose=False,
             print_func("⚠ Detected left tail, refitting with K=3...")
 
         k3_result = _fit_gmm(scores, K=3, entropy_alpha=0.1,
-                             n_init=max(5, n_init), verbose=verbose, print_func=print_func)
+                             n_init=max(5, n_init), verbose=verbose, print_func=print_func,
+                             rng=rng)
         if k3_result is None:
             # K=3 refit failed (numerically unstable with entropy_alpha=0.1);
             # keep the K=2 result and let the degeneracy guard / threshold
@@ -333,7 +365,17 @@ def find_threshold(scores, entropy_alpha=0.85, n_init=1, verbose=False,
                 f"max_implied_K={max_implied_K} (pi_pos={pi_pos_emp:.6f})"
             )
 
-    print_func(f"✅ Optimal threshold: {threshold:.4f}, predicted F1: {predicted_f1:.4f}")
+    _pred_prec, _pred_rec = _compute_pr(threshold, pi, mu, sigma2)
+    find_threshold._last_predicted_precision = _pred_prec
+    find_threshold._last_predicted_recall = _pred_rec
+    # Stash the fitted 2-component model (idx 0 = negative/incorrect, 1 = positive/correct)
+    # so callers can form the likelihood ratio p(s|correct)/p(s|incorrect) and place a
+    # human verdict on the classifier's evidence scale (Chuck's calibration idea).
+    find_threshold._last_components = {'pi': list(map(float, pi)),
+                                       'mu': list(map(float, mu)),
+                                       'sigma2': list(map(float, sigma2))}
+    print_func(f"✅ Optimal threshold: {threshold:.4f}, predicted F1: {predicted_f1:.4f} "
+               f"(predicted precision={_pred_prec:.4f}, recall={_pred_rec:.4f})")
 
     # Generate plot if requested
     if plot_path is not None:
