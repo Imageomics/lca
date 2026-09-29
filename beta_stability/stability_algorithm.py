@@ -104,6 +104,21 @@ class BetaStabilityAlgorithm:
         self._phase0_prev_pcc_count = None
         self._phase0_stall_count = 0
 
+        # Human-review stall detection. A run that cannot reach target_alpha
+        # otherwise keeps requesting reviews until max_human_reviews is spent,
+        # even when the reviews stop improving stability (a livelock on
+        # boundary edges that review cannot settle). When human_stall_patience
+        # > 0, terminate early once the best min-stability (alpha) has not
+        # improved by human_stall_epsilon for that many consecutive review
+        # batches (after at least human_stall_min_reviews). 0 = disabled, so
+        # existing configs are unchanged. Converging runs finish on target_alpha
+        # first and never trigger this.
+        self.human_stall_patience = int(config.get('human_stall_patience', 0))
+        self._stall_epsilon = float(config.get('human_stall_epsilon', 1e-4))
+        self._stall_min_reviews = int(config.get('human_stall_min_reviews', 0))
+        self._best_alpha_seen = -float('inf')
+        self._alpha_stall_batches = 0
+
         # Densification strategy: if True, add likely negative edges first (more aggressive)
         # Default False adds likely positive edges first (less fragmentation)
 
@@ -449,6 +464,25 @@ class BetaStabilityAlgorithm:
             logger.info(f"Reached target alpha ({self.target_alpha})")
             self._finalize('target_alpha')
             return []
+
+        # Stall detection: stop early when human reviews stop improving stability
+        # (config: human_stall_patience batches; 0 = disabled). This caps the
+        # human-review workload of runs that cannot reach target_alpha, without
+        # affecting converging runs (which finalize on target_alpha above).
+        if self.human_stall_patience > 0:
+            if current_alpha > self._best_alpha_seen + self._stall_epsilon:
+                self._best_alpha_seen = current_alpha
+                self._alpha_stall_batches = 0
+            else:
+                self._alpha_stall_batches += 1
+                if (self._alpha_stall_batches >= self.human_stall_patience
+                        and self.num_human_reviews >= self._stall_min_reviews):
+                    logger.info(
+                        f"No stability gain for {self._alpha_stall_batches} review "
+                        f"batches (alpha={current_alpha:.4f}, best="
+                        f"{self._best_alpha_seen:.4f}); stopping to bound human review.")
+                    self._finalize('stalled_no_progress')
+                    return []
 
         # Generate candidate pools — internal, external — without selecting
         # or capping. Caller (here) owns priority order and budget.
