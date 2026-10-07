@@ -28,13 +28,12 @@ class SingleAnnotationException(Exception):
         super().__init__("Only one annotation - skipping LCA clustering")
 
 def kth_diag_indices(a, k):
-    rows, cols = np.diag_indices_from(a)
-    if k < 0:
-        return rows[-k:], cols[:k]
-    elif k > 0:
-        return rows[:-k], cols[k:]
-    else:
-        return rows, cols
+    r, c = a.shape
+    i_start = max(0, -k)
+    i_end = min(r, c - k)
+    rows = np.arange(i_start, i_end)
+    cols = rows + k
+    return rows, cols
 
 
 
