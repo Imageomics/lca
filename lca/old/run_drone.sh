@@ -1,1 +1,0 @@
-python3 run_drone.py --config ./configs/config_drone.yaml 

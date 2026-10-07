@@ -7,6 +7,7 @@ numpy
 scipy
 scikit-learn
 pyyaml
+opencv-python-headless
 Sphinx
 sphinx-rtd-theme
 wbia-utool

@@ -1,20 +1,205 @@
-=======================================
-LCA - Local Clustering and Alternatives
-=======================================
+========================
+Beta Stability
+========================
 
-Reference implementation of the LCA algorithm - still a work in progress, but accelerating :D  
+Stability-driven clustering with active review for wildlife re-identification.
+Given re-identification embeddings and an annotation file, the algorithm builds
+an edge graph, deactivates positive edges to reach an initial ``0``-stable
+state (Phase 0), and then queries a human reviewer for the least-stable edges
+until either a target ``α``-stability is reached or the review budget is spent.
 
-This implementation currently emphasizes experimental evaluation of the capabilities of the LCA algorithm itself.
-As such it simulates a human reviewer from the "ground truth" names (in the form of clusters).
-Soon we will add an interface for a real human reviewer and the resulting intelligent interactive clustering.
-This will allow LCA to be used to correct errors in animal id databases and ultimataely for daily id curation.
+The algorithm selects between top-K and k-means-based initial verifiers
+automatically, based on a silhouette test on the primary embedding at
+the coupon-collector cluster count ``K̂``.
 
 
 Requirements
 ------------
 
-* Python 3.7+
-* Python dependencies listed in requirements.txt
+* Python ≥ 3.11
+* Dependencies managed via ``uv`` (preferred) or ``pip``.
+
+
+Installation
+------------
+
+Using `uv <https://docs.astral.sh/uv/>`_::
+
+    uv sync
+
+Using ``pip`` (for those not on ``uv``)::
+
+    pip install -r requirements.txt
+    pip install -e .
+
+
+Quick start
+-----------
+
+Run against a species using the reference method config and your data config::
+
+    python -m beta_stability.run_clustering_with_save \\
+        --base_config examples/beta_stability_config.yaml \\
+        --config path/to/your_data_config.yaml
+
+The reference method config is at
+`examples/beta_stability_config.yaml <examples/beta_stability_config.yaml>`_.
+Data configs specify the annotation JSON, embedding pickle, output path, and
+any species-specific preprocessing overrides — the ``data:`` section in the
+reference config documents the schema.
+
+Inputs the data config must provide:
+
+* ``annotation_file`` — a JSON with one entry per annotation (``uuid``,
+  ``name``, ``viewpoint``, etc.). ``name_keys`` in the config controls which
+  fields form the ground-truth identity.
+* ``embedding_file`` — a pickle of ``(embedding_matrix, uuid_list)`` from the
+  re-identification model.
+* ``output_path`` — directory where clustering results are written.
+
+Outputs written to ``output_path``:
+
+* ``clustering.json`` — clusters as ``{cluster_id: [node_id, ...]}``.
+* ``node2cid.json`` — inverse mapping ``{node_id: cluster_id}``.
+* ``node2uuid_file.json`` — node index → annotation UUID.
+* ``beta_stability_annots.json`` — annotations enriched with the assigned
+  ``cluster_id``.
+* Evaluation metrics (Hungarian F1, precision, recall) if ground-truth is
+  present.
+
+
+How it works
+------------
+
+Beta Stability treats clustering as a series of local decisions about which
+edges in a graph are trustworthy positives, then iteratively strengthens the
+ones a human confirms. The loop:
+
+1. **Init graph** — build initial edges from an embedding-based verifier. The
+   auto-selector runs k-means at ``K = K̂`` on the primary embedding; if the
+   resulting silhouette is above the threshold, pairwise cosine is used;
+   otherwise the algorithm switches to k-means-based edges.
+2. **Phase 0** — deactivate positive edges until the graph is
+   ``0``-stable (every edge decision is consistent under the current
+   classifier's confidence). No human input yet.
+3. **Active review** — iteratively pick the least-stable edges, send them
+   to a human reviewer (or a simulated one drawn from ground truth for
+   experiments), and re-stabilize after each verdict.
+4. **Terminate** when the target stability ``α`` is reached or the review
+   budget is exhausted.
+
+The reference implementation lives in
+`beta_stability/stability_algorithm.py <beta_stability/stability_algorithm.py>`_.
+
+
+Usage example
+-------------
+
+End-to-end run against a whaleshark dataset.
+
+**1. Prepare data files** (outside the repo, on your data store):
+
+* ``annotations_whaleshark.json`` — a coco-style annotation file with a
+  ``name`` field for identity and (optionally) a ``viewpoint`` field. Each
+  annotation has a unique ``uuid``.
+* ``embeddings_whaleshark.pickle`` — a tuple
+  ``(embedding_matrix, uuid_list)`` from your re-identification model. The
+  ``uuid_list`` must match the annotation file.
+
+**2. Write a data config** (``configs/whaleshark_data.yaml``):
+
+.. code-block:: yaml
+
+    exp_name: whaleshark
+    species: Whale shark
+    data:
+      viewpoint_list: [left]        # keep only left-view annotations
+      name_keys: [name]             # ground-truth identity comes from this field
+      annotation_file: /data/whaleshark/annotations_whaleshark.json
+      embedding_file: /data/whaleshark/embeddings_whaleshark.pickle
+      output_path: /results/whaleshark/beta_stability/
+
+**3. Run**::
+
+    python -m beta_stability.run_clustering_with_save \
+        --base_config examples/beta_stability_config.yaml \
+        --config configs/whaleshark_data.yaml
+
+**4. What you see in the log** (excerpt)::
+
+    AUTO VERIFIER: primary='miewid', τ=0.6590, K̂=183, 1924 positive edges over 997 nodes
+    AUTO VERIFIER: silhouette at K=183 on 'miewid' = 0.0997 (threshold=0.15)
+    AUTO VERIFIER: silhouette < 0.15 → embedding space not clusterable at K̂;
+                   using kmeans-only verifier: ['kmeans(miewid)']
+    Beta Stability Algorithm initialized
+      Target alpha: 0.5
+      Max human reviews: 5000
+    ...
+    Phase: FINISHED
+    Hungarian F1 Score: 0.7609
+
+The auto-verifier's silhouette check decides whether pairwise cosine can
+recover cluster structure. Whaleshark's ``miewid`` embedding is a hard
+case (silhouette ≪ 0.15), so the algorithm switches to k-means edges.
+
+**5. Consume the results** (in ``output_path/``):
+
+.. code-block:: python
+
+    import json
+
+    with open("/results/whaleshark/beta_stability/clustering.json") as f:
+        clustering = json.load(f)
+    # clustering: {"0": [node_id, node_id, …], "1": [...], …}
+
+    with open("/results/whaleshark/beta_stability/node2uuid_file.json") as f:
+        node2uuid = json.load(f)
+    # node2uuid: {node_id: annotation_uuid, …}
+
+    for cluster_id, nodes in clustering.items():
+        uuids = [node2uuid[str(n)] for n in nodes]
+        print(f"Cluster {cluster_id}: {len(uuids)} annotations")
+
+
+Repository layout
+-----------------
+
+.. code-block:: text
+
+    beta_stability/           # the package
+    ├── stability_algorithm.py    # the Beta Stability algorithm
+    ├── stability_graph.py        # its graph data structure
+    ├── algorithm_preparation.py  # top-level orchestration + auto-verifier
+    ├── classifier_system.py      # classifier + threshold framework
+    ├── preprocess.py             # data loader / filters
+    ├── run.py, run_clustering_with_save.py, save_clustering_results.py
+    ├── embeddings/               # embedding backends (miewid, k-means, hdbscan, …)
+    ├── baselines/                # alternative clustering algorithms
+    │                              # (hdbscan, nis, np3_aas, manual_review, thresholded_review)
+    └── util/                     # tools, cluster utilities, GMM threshold, …
+
+    examples/
+    └── beta_stability_config.yaml  # public reference method config
+
+    pyproject.toml            # project metadata + entry points
+    uv.lock                   # locked dependency resolution
+
+
+Configuration essentials
+------------------------
+
+* ``algorithm_type: stability`` (default) selects Beta Stability. Alternative
+  algorithm types are ``hdbscan``, ``nis``, ``np3_aas``, ``manual_review``,
+  ``thresholded_review``.
+* ``initial_topk: auto`` uses the coupon-collector formula
+  ``K = -ln(1 - coverage) · K̂`` where ``K̂`` is the number of connected
+  components in the positive-edge graph.
+* ``verifier_name: auto`` enables the silhouette-based init selector.
+  ``auto_verifier_silhouette_threshold`` (default ``0.15``) is the decision
+  boundary — below it the algorithm switches to a k-means-only init.
+* ``classifier_thresholds`` uses ``auto(fraction)`` to fit a two-component
+  GMM to the pair-score histogram and pick a threshold. See the reference
+  config for the schema.
 
 
 Citation
@@ -25,60 +210,3 @@ If you use this code or its models in your research, please cite:
 .. code:: text
 
     TBD
-
-Documentation
--------------
-
-Currently, yhe documentation is scattered throughout the code, and, of course, some of it is out of date.
-But, a good starting point for how to use it is in curate_using_lca.py.  More to come soon.
-
-
-How to run
--------------
-
-1. Install all requirements:
-
-.. code-block:: python
-
-  install -r requirements.txt
-
-2. Prepare the configuration file according to the example in `configs/config_default.yaml`.
-Important details about the configuration file:
-
-* You need a JSON file with annotations. The annotations should contain ground truth information. 'name_keys' in configuration file should be setup to specify how the ground truth are constructed.  
-* You need an `embeddings.pickle` file containing embeddings from the re-identification method output for each annotation.
-
-Detailed documentation can be found in `configs/config_default.yaml`.
-
-
-3. Run the `run.sh` script (make sure it has executable permission). This script executes the `run.py` script with the provided configuration file. You can also directly run `run.py` with the config file by executing:
-
-.. code-block:: bash
-  
-  python3 run.py --config ./configs/config_default.yaml
-
-
-4. While LCA is running, you can follow its progress in the `log_file` specified in the config file. Search for `Incremental_stats` to see the accuracy metrics.
-
-
-5. When LCA is finished, you can find 3 files saved under `db_path`/`exp_name`:
-
-- `quads.csv`: Database file where each quad is of the form (n0, n1, w, aug_name). Here, n0 and n1 are the nodes, w is the signed weight, and aug_name is the augmentation method (a verification algorithm or a human annotator/reviewer) that produced the edge.
-
-- `verifiers_probs.json`: Dictionary containing verification scores/probabilities and associated human decisions. The keys of the dictionary are the verification (augmentation) algorithm names, and the values are dictionaries of probabilities for pairs marked positive (same animal) and negative. Note that the relative proportion of positive and negative scores can matter. This is entirely used for the weighting calibration.
-  
-.. code-block:: python
-  
-  ALGO_AUG_NAME: {
-      'gt_positive_probs': new_pos_probs,
-      'gt_negative_probs': new_neg_probs,
-  }
-  
-
-- `clustering.json`: The changes to the clustering the method started with, represented as a mapping from cluster ID to a list (or set) of annotation/node IDs.
-
-
-Task list
----------
-
-https://docs.google.com/document/d/1Ph9CggXPqkzHC-pBEABDTftJxBdBgJIUo8EEJoMzkbo/edit

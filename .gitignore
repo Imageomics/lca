@@ -1,26 +1,54 @@
+# Version files (dynamic)
 version.py
-
-.DS_Store
-__pycache__/
-
-example/lca.log
 _version.py
 
-test*.png
+# OS / editor cruft
+.DS_Store
+.codex
 
-lca/tmp/
-data/configs/
-!data/configs/config.yaml
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
 
-data/*
-lca/configs/
-lca/data/*
-lca/visualisations/
-!lca/configs/config_default.yaml
+# Virtual envs / uv
+.venv/
+.env
 
-ui/node_modules
+# Test / coverage
+.coverage
+.pytest_cache/
+htmlcov/
+coverage.xml
 
+# Ignored dirs
+tmp/
+internal/
+notebooks/
+beta_stability/tmp/
+beta_stability/exploratory/
+beta_stability/old/
+beta_stability/visualisations/
+beta_stability/results*
+beta_stability/sbatch/
+
+# Configs are internal — only the reference config in examples/ is public
+beta_stability/configs/
+
+# Data files never live in the repo
 *.pickle
+*.pkl
 *.json
 *.zip
-.codex
+*.gradio
+data/
+beta_stability/data/
+
+# Frontend (kept for legacy paths)
+ui/node_modules
+
+.claude

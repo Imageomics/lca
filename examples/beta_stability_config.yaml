@@ -1,0 +1,70 @@
+# =============================================================================
+# Beta-stability reference configuration.
+#
+# Run:
+#   python run_clustering_with_save.py \
+#       --base_config examples/beta_stability_config.yaml \
+#       --config path/to/your_data_config.yaml
+#
+# `your_data_config.yaml` provides data paths and species-specific
+# preprocessing overrides — see the `data:` section at the bottom of this
+# file for the schema.
+# =============================================================================
+
+algorithm_type: stability
+
+algorithm:
+  # Auto initial_topk uses the coupon-collector formula
+  #     K = -ln(1 - coverage) · K̂
+  # where K̂ is the number of connected components of the full positive
+  # graph at the GMM-selected threshold τ. Coverage 0.9 → K ≈ 2.3·K̂.
+  initial_topk: auto
+  auto_topk_coverage: 0.9
+  max_outer_iterations: 10000
+
+stability:
+  # Core algorithm hyperparameters
+  theta: 0.1
+  target_alpha: 0.5
+  phase0_alpha: 0.0
+  max_human_reviews: 5000
+  edges_per_review_batch: 200
+  validation_step: 100
+  review_confidence: auto      # auto = mapped from GMM predicted F1
+  tries_before_edge_done: auto
+  max_phase0_iterations: auto
+
+  # Silhouette-based auto-selection of the init verifier list.
+  # Runs k-means at K = K̂ on the primary embedding; if silhouette < threshold,
+  # embedding space is not cleanly clusterable at K̂ and the algorithm switches
+  # to a kmeans-only verifier. Otherwise it uses the primary verifier alone.
+  verifier_name: auto
+  auto_verifier_silhouette_threshold: 0.15
+  auto_verifier_primary: miewid
+
+  kmeans_fallback_cluster_size: 1
+
+edge_weights:
+  # Classifier calibration for the primary embedding. `auto(0.2)` fits a
+  # two-component GMM to the pairwise-score histogram and picks the threshold
+  # at which the negative component's right-tail integrates to 0.2 of the
+  # positive component's mass. Adjust the fraction only if you understand
+  # what it controls.
+  classifier_thresholds:
+    miewid: auto(0.2)
+  prob_human_correct: 1.0
+  verifier_names: miewid simulated_human
+
+data:
+  # Data-level filters applied to the annotation file. Any `<field>_list`
+  # entry becomes a whitelist for that annotation field (e.g. `viewpoint_list`
+  # keeps only the specified viewpoints).
+  id_key: uuid
+  n_filter_min: 1
+  n_filter_max: 100
+  separate_viewpoints: false
+
+logging:
+  log_level: INFO
+  update_log_file: true
+  file_mode: w

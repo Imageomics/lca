@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "beta_stability"
+version = "0.1.0"
+description = "Beta Stability — stability-driven clustering with active review for wildlife re-identification."
+readme = "README.rst"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Kate Nepovinnykh", email = "codeblackwell@gmail.com" },
+]
+dependencies = [
+    "typing-extensions",
+    "h5py",
+    "hdbscan",
+    "matplotlib",
+    "networkx",
+    "numpy",
+    "opencv-python-headless",
+    "pandas",
+    "pillow",
+    "pyyaml",
+    "scikit-learn",
+    "scipy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-subprocess",
+    "coverage",
+    "codecov",
+    "xdoctest",
+    "brunette",
+]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+]
+
+[project.scripts]
+beta_stability-cluster = "beta_stability.run_clustering_with_save:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["beta_stability"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "beta_stability",
+    "README.rst",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.uv]
+package = true
