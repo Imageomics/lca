@@ -31,7 +31,7 @@ Usage: python3 -m beta_stability.run_baseline --species beluga
 import argparse
 from pathlib import Path
 
-BASELINE_DIR = Path('/users/PAS2136/nepove/code/lca/beta_stability/tmp/baseline')
+BASELINE_DIR = Path('/users/PAS2136/nepove/code/beta-stability/beta_stability/tmp/baseline')
 
 
 def main():
